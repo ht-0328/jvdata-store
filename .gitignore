@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 取得したデータ・実行時の状態
+out*/
+raw*/
+state.json
+.uv-cache/
+test-artifacts/
+*.duckdb
+
+# ドキュメントのビルド成果物
+site/

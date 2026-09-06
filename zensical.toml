@@ -1,0 +1,128 @@
+[project]
+site_url = "https://ht-0328.github.io/jvdata-store/"
+site_name = "JV-Data の読み方"
+site_description = "JRA-VAN Data Lab. が配信する JV-Data の仕様を、実データで確かめながらまとめたドキュメント"
+
+repo_url = "https://github.com/ht-0328/jvdata-store"
+repo_name = "ht-0328/jvdata-store"
+edit_uri = "edit/main/docs/"
+
+nav = [
+  { "JV-Data の読み方" = "index.md" },
+  { "解説" = [
+    { "01 JV-Data の全体像" = "01-overview.md" },
+    { "02 レコードの読み方" = "02-record-format.md" },
+    { "03 データ種別と提供タイミング" = "03-dataspecs.md" },
+    { "04 レコードのつながり" = "04-relations.md" },
+  ] },
+  { "参照" = [
+    { "レコード索引" = "reference/index.md" },
+    { "コード表" = "reference/codes.md" },
+    { "蓄積系レコード" = [
+      { "TK 特別登録馬" = "reference/TK.md" },
+      { "RA レース詳細" = "reference/RA.md" },
+      { "SE 馬毎レース情報" = "reference/SE.md" },
+      { "HR 払戻" = "reference/HR.md" },
+      { "H1 票数１" = "reference/H1.md" },
+      { "H6 票数6（3連単）" = "reference/H6.md" },
+      { "O1 オッズ1（単複枠）" = "reference/O1.md" },
+      { "O2 オッズ2（馬連）" = "reference/O2.md" },
+      { "O3 オッズ3（ワイド）" = "reference/O3.md" },
+      { "O4 オッズ4（馬単）" = "reference/O4.md" },
+      { "O5 オッズ5（3連複）" = "reference/O5.md" },
+      { "O6 オッズ6（3連単）" = "reference/O6.md" },
+      { "UM 競走馬マスタ" = "reference/UM.md" },
+      { "KS 騎手マスタ" = "reference/KS.md" },
+      { "CH 調教師マスタ" = "reference/CH.md" },
+      { "BR 生産者マスタ" = "reference/BR.md" },
+      { "BN 馬主マスタ" = "reference/BN.md" },
+      { "HN 繁殖馬マスタ" = "reference/HN.md" },
+      { "SK 産駒マスタ" = "reference/SK.md" },
+      { "CK 出走別着度数" = "reference/CK.md" },
+      { "RC レコードマスタ" = "reference/RC.md" },
+      { "HC 坂路調教" = "reference/HC.md" },
+      { "HS 競走馬市場取引価格" = "reference/HS.md" },
+      { "HY 馬名の意味由来" = "reference/HY.md" },
+      { "YS 開催スケジュール" = "reference/YS.md" },
+      { "BT 系統情報" = "reference/BT.md" },
+      { "CS コース情報" = "reference/CS.md" },
+      { "DM タイム型データマイニング予想" = "reference/DM.md" },
+      { "TM 対戦型データマイニング予想" = "reference/TM.md" },
+      { "WF 重勝式(WIN5)" = "reference/WF.md" },
+      { "JG 競走馬除外情報" = "reference/JG.md" },
+      { "WC ウッドチップ調教" = "reference/WC.md" },
+    ] },
+    { "速報系レコード" = [
+      { "WH 馬体重" = "reference/WH.md" },
+      { "WE 天候馬場状態" = "reference/WE.md" },
+      { "AV 出走取消・競走除外" = "reference/AV.md" },
+      { "JC 騎手変更" = "reference/JC.md" },
+      { "TC 発走時刻変更" = "reference/TC.md" },
+      { "CC コース変更" = "reference/CC.md" },
+    ] },
+  ] },
+]
+
+[project.theme]
+language = "ja"
+features = [
+  "content.action.edit",
+  "content.code.annotate",
+  "content.code.copy",
+  "content.tooltips",
+  "navigation.footer",
+  "navigation.indexes",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.path",
+  "navigation.sections",
+  "navigation.top",
+  "navigation.tracking",
+  "search.highlight",
+  "toc.follow",
+]
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "ライトモードに切り替える"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "ダークモードに切り替える"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "システム設定に合わせる"
+
+[project.markdown_extensions]
+abbr = {}
+admonition = {}
+attr_list = {}
+def_list = {}
+footnotes = {}
+md_in_html = {}
+tables = {}
+toc.permalink = true
+toc.title = "このページの内容"
+toc.slugify.object = "pymdownx.slugs.slugify"
+toc.slugify.kwds.case = "lower"
+pymdownx.betterem = {}
+pymdownx.caret = {}
+pymdownx.details = {}
+pymdownx.highlight.anchor_linenums = true
+pymdownx.highlight.line_spans = "__span"
+pymdownx.highlight.pygments_lang_class = true
+pymdownx.inlinehilite = {}
+pymdownx.keys = {}
+pymdownx.mark = {}
+pymdownx.quotes.callouts = true
+pymdownx.smartsymbols = {}
+pymdownx.superfences = {}
+pymdownx.tabbed.alternate_style = true
+pymdownx.tasklist.custom_checkbox = true
+pymdownx.tilde = {}

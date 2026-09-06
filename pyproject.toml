@@ -1,0 +1,30 @@
+[project]
+name = "jvdata-store"
+version = "0.1.0"
+description = "JRA-VAN Data Lab. (JV-Link) のデータを JV-Data 仕様書の表単位で DuckDB に貯める"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.5.5",
+    "pywin32>=306 ; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+spec = ["openpyxl>=3.1"]
+
+[project.scripts]
+jvstore = "jvstore.cli:main"
+
+[dependency-groups]
+dev = ["openpyxl>=3.1", "pytest>=8", "zensical>=0.0.59"]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "jvstore"
+source-include = ["src/jvstore/resources/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
