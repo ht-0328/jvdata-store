@@ -42,6 +42,20 @@ class Task:
         self.log: list[str] = []
         self.finished_at: str | None = None
         self.status = "idle"
+        #: サーバーを止めると決めたあとは、新しい処理を始めない。
+        self.closed = False
+
+    def close_if_idle(self) -> bool:
+        """動いている処理が無ければ締めて True。動いていれば何もせず False。
+
+        「動いていないことの確認」と「新しい処理を断ること」を同じロックの中で
+        行う。分けると、確認の直後に始まった取得をサーバーの停止が断ち切る。
+        """
+        with self.lock:
+            if self.running:
+                return False
+            self.closed = True
+            return True
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
@@ -61,7 +75,7 @@ class Task:
 
     def _begin(self, label: str) -> bool:
         with self.lock:
-            if self.running:
+            if self.running or self.closed:
                 return False
             self.running = True
             self.status = "running"

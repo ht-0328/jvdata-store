@@ -114,10 +114,46 @@
   .gridwrap th:first-child { z-index: 3; }
   .pager { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
            margin: 12px 0; font-size: 13px; font-family: var(--mono); }
+
+  /* -- 使い方・停止の予約 ------------------------------------------------ */
+  #help { margin: 16px 18px; }
+  #help[hidden], #stopbar[hidden] { display: none; }
+  #help table { margin: 6px 0 10px; }
+  #help th { position: static; background: none; }
+  #help td:first-child { white-space: nowrap; font-weight: 700; color: var(--gold); }
+  #stopbar { background: #2a2113; color: var(--gold); border-bottom: 1px solid var(--line);
+             padding: 8px 18px; font-weight: 700; }
 </style>
 </head>
 <body>
-<header><h1>jvstore</h1><span class="muted">JRA-VAN データ取得・管理</span><span class="grow"></span><span id="summary" class="muted"></span></header>
+<header><h1>jvstore</h1><span class="muted">JRA-VAN データ取得・管理</span><span class="grow"></span><span id="summary" class="muted"></span>
+  <button id="help-toggle" aria-expanded="false" aria-controls="help">使い方</button></header>
+<div id="stopbar" role="status" hidden></div>
+<section id="help" class="card" hidden>
+  <h2>使い方：起動・停止・画面の開き直し</h2>
+  <!-- 日本語の文の途中で改行すると空白として表示されるため、1文ずつ1行に書く。 -->
+  <p>サーバーの起動・停止・画面の開き直しは、<b>操作パネル</b>で行います。<!--
+  -->操作パネルは、jvdata-store フォルダの <code>run.bat</code> をダブルクリックすると開く小さなウィンドウです。<!--
+  -->ブラウザからはサーバーを起動できないため、ブラウザの画面とは分けています。</p>
+  <table>
+    <thead><tr><th>やりたいこと</th><th>操作</th></tr></thead>
+    <tbody>
+      <tr><td>起動する</td>
+          <td><code>run.bat</code> をダブルクリックします。止まっていれば自動で起動し、この画面が開きます。<!--
+          -->停止したあとは、操作パネルの「起動」で起動し直せます。</td></tr>
+      <tr><td>閉じた画面を開き直す</td>
+          <td>操作パネルの「画面を開く」を押します。操作パネルも閉じていたら、<code>run.bat</code> をもう一度ダブルクリックします。<!--
+          -->動いているサーバーをそのまま使うので、取得の途中でも止まりません。</td></tr>
+      <tr><td>停止する</td>
+          <td>操作パネルの「停止」を押します。取得の途中なら「終わってから停止しますか？」と聞かれます。<!--
+          -->「はい」なら取得が終わったときに自動で停止し、「いいえ」なら停止しません。</td></tr>
+      <tr><td>停止の予約をやめる</td>
+          <td>操作パネルの「予約を取り消す」を押します。</td></tr>
+    </tbody>
+  </table>
+  <p class="hint">ブラウザのタブや操作パネルを閉じても、サーバーは止まりません。<!--
+  -->取得の途中で止めることはできません。途中で止めると、データが途中までしか入らないためです。</p>
+</section>
 <section id="acquisition" class="card">
   <h2>JRA-VAN データ取得</h2>
   <p class="hint">過去のレース・競走馬・血統・調教などを取得します。初回は指定年数ぶん、2回目からは前回以降の更新を取り込みます。</p>
@@ -167,6 +203,9 @@ function renderTask(t){
   $("#task-status").style.color = t.status === "failed" ? "var(--red)" : "var(--green)";
   $("#log").textContent = t.log.join("\n");
   $("#log").scrollTop = $("#log").scrollHeight;
+  $("#stopbar").hidden = !t.stop_reserved;
+  $("#stopbar").textContent = `「${t.label}」が終わったら、このサーバーは停止します。`
+    + "やめるときは、操作パネルの「予約を取り消す」を押してください。";
 }
 
 async function pollTask(){
@@ -175,13 +214,36 @@ async function pollTask(){
     const t = await response.json();
     if (!response.ok || t.error) throw new Error(t.error || "進捗を取得できません");
     renderTask(t);
-    if (t.running) polling = setTimeout(pollTask, 800);
+    // 停止を予約していれば、止まったことを伝えるために見張りを続ける。
+    if (t.running || t.stop_reserved) polling = setTimeout(pollTask, 800);
     else { polling = null; refreshView(); }
   } catch (error) {
+    // 操作パネルで停止したあとも、ここに来る。起動の仕方を案内する。
+    $("#stopbar").hidden = true;
     $("#taskbar").hidden = false;
-    $("#task-status").textContent = `接続を再確認しています：${error.message}`;
+    $("#task-status").textContent = "サーバーに接続できません。停止している場合は、"
+      + "操作パネルの「起動」（操作パネルが無ければ run.bat）で起動してください。";
+    $("#task-status").style.color = "var(--red)";
     polling = setTimeout(pollTask, 3000);
   }
+}
+
+// -- 使い方 ----------------------------------------------------------------
+
+function showHelp(open){
+  $("#help").hidden = !open;
+  $("#help-toggle").setAttribute("aria-expanded", String(open));
+  $("#help-toggle").textContent = open ? "使い方を閉じる" : "使い方";
+}
+$("#help-toggle").onclick = () => showHelp($("#help").hidden);
+
+/** 初めて開いたときだけ、使い方を開いておく。 */
+function showHelpOnFirstVisit(){
+  try {
+    if (localStorage.getItem("help-seen")) return;
+    localStorage.setItem("help-seen", "1");
+  } catch { return; }   // 保存できないブラウザでは、毎回開くより閉じておく
+  showHelp(true);
 }
 
 /** 取得系はどれも時間がかかるので、ログを出して終わるまでボタンを止める。 */
@@ -345,6 +407,7 @@ $("#hsetup").onclick = () => {
 };
 
 async function initialize(){
+  showHelpOnFirstVisit();
   setBusy(true);
   try {
     const info = await (await fetch("/api/info")).json();

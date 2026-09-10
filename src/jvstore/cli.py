@@ -568,6 +568,34 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_panel(args: argparse.Namespace) -> int:
+    """操作パネルを開く。サーバーは `serve` と同じ引数で別プロセスとして起動する。"""
+    import tempfile
+
+    from .web.local_server import LocalServer, console_python
+    from .web.panel import run_panel
+
+    db = Path(args.db).resolve()
+    command = [console_python(), "-m", "jvstore.cli", "serve",
+               "--db", str(db), "--port", str(args.port)]
+    log_path = Path(tempfile.gettempdir()) / f"jvstore-serve-{args.port}.log"
+    run_panel(LocalServer("jvdata-store", args.port, command, Path.cwd(), log_path),
+              "jvdata-store")
+    return 0
+
+
+def _add_screen_parsers(subparsers: argparse._SubParsersAction) -> None:
+    screen = subparsers.add_parser("serve", help="データ取得・管理画面を開く")
+    panel = subparsers.add_parser(
+        "panel", help="画面の起動・停止・開き直しを行う操作パネルを開く（run.bat はこれを使う）")
+    for parser in (screen, panel):
+        parser.add_argument("--db", type=Path, default=Path("jvdata.duckdb"))
+        parser.add_argument("--port", type=int, default=8766)
+    screen.add_argument("--open", action="store_true", help="ブラウザを開く")
+    screen.set_defaults(func=cmd_serve)
+    panel.set_defaults(func=cmd_panel)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jvstore",
@@ -582,11 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_parse_parser(subparsers)
     _add_sync_parser(subparsers)
     _add_setup_parser(subparsers)
-    screen = subparsers.add_parser("serve", help="データ取得・管理画面を開く")
-    screen.add_argument("--db", type=Path, default=Path("jvdata.duckdb"))
-    screen.add_argument("--port", type=int, default=8766)
-    screen.add_argument("--open", action="store_true", help="ブラウザを開く")
-    screen.set_defaults(func=cmd_serve)
+    _add_screen_parsers(subparsers)
     return parser
 
 
