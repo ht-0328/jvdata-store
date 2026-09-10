@@ -15,21 +15,30 @@ import duckdb
 
 from ..sync import SYNC_DATASPECS
 from .db_lock import DatabaseLock
+from .shutdown import Shutdown
 from .tables import TableBrowser
 from .tasks import Task
 
 STATIC = Path(__file__).parent / "static"
 DEFAULT_PORT = 8766
 
+#: 停止の指示。`now` は処理中なら断り、`after_task` は処理が終わってから止める。
+SHUTDOWN_MODES = ("now", "after_task", "cancel")
+
 
 class Backend:
     def __init__(self, db: Path):
         self.db = db.resolve()
         self.task = Task()
+        self.shutdown = Shutdown(self.task)
         self._lock = DatabaseLock(self.db)
 
     def info(self):
         return {"app": "jvdata-store", "db": str(self.db)}
+
+    def task_status(self):
+        """処理の進み具合。停止を予約していれば、それも画面に伝える。"""
+        return {**self.task.snapshot(), "stop_reserved": self.shutdown.reserved}
 
     def dataspecs(self):
         return [{"id": name, "title": title} for name, title in SYNC_DATASPECS]
@@ -110,7 +119,7 @@ def make_handler(backend: Backend):
                 if url.path == "/api/info":
                     return self._json(backend.info())
                 if url.path == "/api/task":
-                    return self._json(backend.task.snapshot())
+                    return self._json(backend.task_status())
                 if url.path == "/api/dataspecs":
                     return self._json({"dataspecs": backend.dataspecs()})
                 if url.path == "/api/history/tables":
@@ -134,7 +143,11 @@ def make_handler(backend: Backend):
         def do_POST(self):
             url = urlparse(self.path)
             query = parse_qs(url.query)
+            if not _is_local_request(self.headers, self.server.server_address[1]):
+                return self._json({"error": "この画面以外からの操作は受け付けません。"}, 403)
             try:
+                if url.path == "/api/shutdown":
+                    return self._shutdown(_one(query, "when", "now"))
                 if url.path == "/api/jvlink-setup":
                     return self._json({"started": backend.jvlink_setup()})
                 if url.path != "/api/history/fetch":
@@ -156,7 +169,36 @@ def make_handler(backend: Backend):
             except Exception as error:  # noqa: BLE001  画面に理由を返し、サーバは止めない
                 return self._json({"error": str(error)}, 500)
 
+        def _shutdown(self, when):
+            if when not in SHUTDOWN_MODES:
+                raise ValueError("停止の指定が不正です。")
+            if when == "cancel":
+                backend.shutdown.cancel()
+                return self._json({"stop_reserved": False})
+            if when == "after_task":
+                backend.shutdown.after_task(self.server.shutdown)
+                return self._json({"stop_reserved": True})
+            if backend.shutdown.now(self.server.shutdown):
+                return self._json({"stopped": True})
+            label = backend.task.snapshot()["label"]
+            return self._json({"error": f"「{label}」を実行中のため、停止できません。",
+                               "running": label}, 409)
+
     return Handler
+
+
+def _is_local_request(headers, port):
+    """この画面（127.0.0.1 / localhost の同じポート）から来た操作か。
+
+    よそのサイトを開いたブラウザが、裏でこのサーバーへ停止や取得を送れないようにする。
+    Origin が無いのはブラウザ以外（操作パネル・テスト）からの呼び出し。
+    Host も確かめるのは、DNS をすり替えて「同じ生まれ」を装う手口を断つため。
+    """
+    host = headers.get("Host", "")
+    if host not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+        return False
+    origin = headers.get("Origin")
+    return origin is None or origin == f"http://{host}"
 
 
 class _Server(ThreadingHTTPServer):
@@ -187,8 +229,10 @@ def serve(db: Path, port: int = DEFAULT_PORT, open_browser: bool = False):
     if open_browser:
         webbrowser.open(url)
     try:
+        # 操作パネルの「停止」（/api/shutdown）でも、ここから抜ける。
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+    print("停止しました。", flush=True)
