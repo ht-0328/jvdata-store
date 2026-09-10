@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from threading import Event
-from typing import Callable, Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Sequence
 
 from .layout import LayoutSet, load_layouts
 from .store import DuckStore
+
+if TYPE_CHECKING:  # JV-Link は Windows + COM が必要なので実行時には読み込まない
+    from .jvlink import JVLink, OpenResult
 
 __all__ = ["SYNC_DATASPECS", "Cancelled", "SyncResult", "check_cancel", "sync"]
 
@@ -44,6 +48,23 @@ SYNC_DATASPECS: tuple[tuple[str, str], ...] = (
 
 TITLES = dict(SYNC_DATASPECS)
 
+#: ``_meta`` に前回の続きの時刻を残すときのキーの接頭辞。
+_META_PREFIX = "sync:"
+
+#: JVOpen の option。1:通常（前回の続き） 4:ダイアログ無しセットアップ。
+_OPTION_CONTINUE = 1
+_OPTION_SETUP = 4
+
+#: JRA-VAN の提供開始年。これより前は指定しない。
+_FIRST_YEAR = 1986
+
+#: 過去年数として受け付ける範囲（両端を含む）。
+_MIN_YEARS = 1
+_MAX_YEARS = 40
+
+#: 途中経過を出すレコード件数の刻み。
+_PROGRESS_EVERY = 50000
+
 
 class Cancelled(Exception):
     """利用者が中止した。取得済みのぶんは残す。"""
@@ -63,26 +84,17 @@ class SyncResult:
     counts: dict[str, int] = field(default_factory=dict)
 
 
-def start_time(years: int, today: "date | None" = None) -> str:
+def start_time(years: int, today: date | None = None) -> str:
     """`JVOpen` に渡す読み出し開始時刻。
 
     **年の1月1日まで切り下げる。** JV-Link はセットアップデータを月単位の
     ファイルで持っているので、月の途中を指定しても意味がない。
     JRA-VAN の提供開始は 1986 年なので、それより前は指定しない。
     """
-    from datetime import date as _date
-
-    if not 1 <= years <= 40:
-        raise ValueError("過去年数は1〜40年で指定してください。")
-    year = (today or _date.today()).year - years
-    return f"{max(1986, year):04d}0101000000"
-
-
-def _ready_link(factory):
-    """初期化まで済ませた JV-Link を返す。"""
-    link = factory()
-    link.init()
-    return link
+    if not _MIN_YEARS <= years <= _MAX_YEARS:
+        raise ValueError(f"過去年数は{_MIN_YEARS}〜{_MAX_YEARS}年で指定してください。")
+    year = (today or date.today()).year - years
+    return f"{max(_FIRST_YEAR, year):04d}0101000000"
 
 
 def sync(
@@ -104,82 +116,139 @@ def sync(
     途中で失敗したデータ種別があっても、残りは続ける。1種別の不調で
     全部が止まると、数時間かけた取得をやり直すことになる。
     """
-    from .jvlink import JVLink, JVLinkError
+    from .jvlink import JVLink
 
     layouts = layouts or load_layouts()
-    specs = [s.upper() for s in (dataspecs or [d for d, _ in SYNC_DATASPECS])]
+    specs = [name.upper() for name in (dataspecs or [name for name, _ in SYNC_DATASPECS])]
     start = start_time(years)
-    out = SyncResult()
+    summary = SyncResult()
 
     log(f"過去 {years} 年（{start[:4]}年1月1日以降）の蓄積系データを取得します")
     log(f"対象データ種別: {', '.join(specs)}")
     log(f"保存先: {db_path.resolve()}")
 
     store = DuckStore(db_path, layouts, only=only)
-    link = link_factory() if link_factory else _ready_link(JVLink)
+    link = link_factory() if link_factory else _initialised_link(JVLink)
     try:
-        for i, spec in enumerate(specs, 1):
+        for position, dataspec in enumerate(specs, 1):
             check_cancel(stop)
-            saved = store.meta(f"sync:{spec}")
-            fromtime, option = (
-                (saved, 1) if saved and not force_setup else (start, 4)
-            )
-            kind = "続きから" if option == 1 else "セットアップ"
+            fromtime, option = _resume_point(store, dataspec, start, force_setup)
+            kind = "続きから" if option == _OPTION_CONTINUE else "セットアップ"
             log("")
-            log(f"[{i}/{len(specs)}] {spec} {TITLES.get(spec, '')} — {kind} {fromtime}")
-            try:
-                result = link.open(spec, fromtime, option)
-            except JVLinkError as e:
-                log(f"  取得できませんでした: {e}")
-                out.failed.append(spec)
-                continue
-            log(
-                f"  対象ファイル {result.read_count:,} 件 / 要ダウンロード "
-                f"{result.download_count:,} 件"
+            log(f"[{position}/{len(specs)}] {dataspec} {TITLES.get(dataspec, '')}"
+                f" — {kind} {fromtime}")
+            _sync_dataspec(
+                link, store, dataspec, fromtime, option, summary,
+                log=log, stop=stop, dry_run=dry_run,
             )
-            if result.read_count == 0 or dry_run:
-                if not dry_run and result.last_file_timestamp:
-                    store.set_meta(f"sync:{spec}", result.last_file_timestamp)
-                link.close()
-                continue
-            try:
-                _read(link, store, spec, result, log, stop, out)
-            except Cancelled:
-                raise
-            except Exception as e:  # noqa: BLE001
-                log(f"  読み込みに失敗しました: {e}")
-                out.failed.append(spec)
-            finally:
-                link.close()
     finally:
-        with_error = None
+        close_error = None
         try:
             link.close()
-        except Exception as e:  # noqa: BLE001
-            with_error = e
-        out.counts = store.counts()
+        except Exception as error:  # noqa: BLE001
+            close_error = error
+        summary.counts = store.counts()
         store.close()
-        if with_error is not None:
-            log(f"JV-Link を閉じられませんでした: {with_error}")
-    return out
+        if close_error is not None:
+            log(f"JV-Link を閉じられませんでした: {close_error}")
+    return summary
 
 
-def _read(link, store: DuckStore, spec: str, result, log, stop, out: SyncResult) -> None:
+def _initialised_link(factory: Callable[[], Any]) -> Any:
+    """初期化まで済ませた JV-Link を返す。"""
+    link = factory()
+    link.init()
+    return link
+
+
+def _resume_point(
+    store: DuckStore, dataspec: str, start: str, force_setup: bool
+) -> tuple[str, int]:
+    """読み出し開始時刻と JVOpen の option。
+
+    前回どこまで取ったかが ``_meta`` に残っていれば続きから、無ければ
+    （あるいは取り直しを指示されていれば）セットアップから取る。
+    """
+    saved = store.meta(_META_PREFIX + dataspec)
+    if saved and not force_setup:
+        return saved, _OPTION_CONTINUE
+    return start, _OPTION_SETUP
+
+
+def _sync_dataspec(
+    link: "JVLink",
+    store: DuckStore,
+    dataspec: str,
+    fromtime: str,
+    option: int,
+    summary: SyncResult,
+    *,
+    log: Callable[[str], None],
+    stop: Event | None,
+    dry_run: bool,
+) -> None:
+    """1データ種別ぶんを取り込む。失敗しても呼び手は次の種別へ進む。"""
+    from .jvlink import JVLinkError
+
+    try:
+        result = link.open(dataspec, fromtime, option)
+    except JVLinkError as error:
+        log(f"  取得できませんでした: {error}")
+        summary.failed.append(dataspec)
+        return
+    log(
+        f"  対象ファイル {result.read_count:,} 件 / 要ダウンロード "
+        f"{result.download_count:,} 件"
+    )
+    if result.read_count == 0 or dry_run:
+        if not dry_run:
+            _remember_progress(store, dataspec, result)
+        link.close()
+        return
+    try:
+        _read_records(link, store, dataspec, result, summary, log=log, stop=stop)
+    except Cancelled:
+        raise
+    except Exception as error:  # noqa: BLE001
+        log(f"  読み込みに失敗しました: {error}")
+        summary.failed.append(dataspec)
+    finally:
+        link.close()
+
+
+def _read_records(
+    link: "JVLink",
+    store: DuckStore,
+    dataspec: str,
+    result: "OpenResult",
+    summary: SyncResult,
+    *,
+    log: Callable[[str], None],
+    stop: Event | None,
+) -> None:
     """1データ種別ぶんを読み切って書き込む。"""
     link.wait_download(
-        result, on_progress=lambda d, t: log(f"  ダウンロード {d:,}/{t:,}")
+        result,
+        on_progress=lambda done, total: log(f"  ダウンロード {done:,}/{total:,}"),
     )
-    n = 0
+    written = 0
     started = time.time()
-    for rec in link.records(on_file=lambda f: log(f"  読込: {f}")):
+    for record in link.records(on_file=lambda name: log(f"  読込: {name}")):
         check_cancel(stop)
-        store.write(rec.data)
-        n += 1
-        if n % 50000 == 0:
-            log(f"  {n:,} レコード ({time.time() - started:.0f}秒)")
+        store.write(record.data)
+        written += 1
+        if written % _PROGRESS_EVERY == 0:
+            log(f"  {written:,} レコード ({time.time() - started:.0f}秒)")
     store.flush()
     # 読み切ってから記録する。途中で落ちたら次回もう一度同じ範囲を取る。
+    _remember_progress(store, dataspec, result)
+    summary.records += written
+    log(f"  {written:,} レコード / {time.time() - started:.1f} 秒")
+
+
+def _remember_progress(
+    store: DuckStore, dataspec: str, result: "OpenResult"
+) -> None:
+    """次回の続きの起点を残す。タイムスタンプが取れないときは触らない。"""
     if result.last_file_timestamp:
-        store.set_meta(f"sync:{spec}", result.last_file_timestamp)
-    out.records += n
-    log(f"  {n:,} レコード / {time.time() - started:.1f} 秒")
+        store.set_meta(_META_PREFIX + dataspec, result.last_file_timestamp)

@@ -25,12 +25,18 @@ import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import duckdb
 
 from .layout import Item, LayoutSet, RecordLayout
-from .record import ENCODING, SEPARATOR_NAME, record_id_of
+from .record import (
+    ENCODING,
+    SEPARATOR_NAME,
+    UNKNOWN_STATS_KEY,
+    padded_record,
+    record_id_of,
+)
 
 __all__ = ["DuckStore", "TableSpec", "build_specs", "VERSION_COLUMN", "SEQ_COLUMN"]
 
@@ -40,6 +46,10 @@ VERSION_COLUMN = "_版"
 #: 子テーブルで繰返しの何回目かを表す列。仕様書の列名と衝突しないよう `_` で始める
 #: （`TK 登録馬毎情報` は仕様書側に `連番` という列を持っている）。
 SEQ_COLUMN = "_連番"
+
+#: 同名の列が2つ目に出てきたときに付ける接尾辞。仕様書の表内でも子テーブルでも
+#: 同じ規則にそろえる。
+_DUPLICATE_SUFFIX = "#2"
 
 #: ``データ区分`` を新旧比較できる1文字へ写す。
 #:
@@ -60,8 +70,11 @@ _EXTRA_KEYS = {
     "O6": ("発表月日時分",),
 }
 
+#: レコード内の位置から値を切り出す関数。桁埋めを削るかどうかで差し替える。
+CutValue = Callable[[bytes, int, int], str]
 
-def _ident(name: str) -> str:
+
+def _quoted(name: str) -> str:
     """DuckDB の引用識別子にする。日本語の列名はこれで通る。"""
     return '"' + name.replace('"', '""') + '"'
 
@@ -72,7 +85,7 @@ def _slug(name: str) -> str:
 
 
 @dataclass(slots=True)
-class Field:
+class ColumnCut:
     """テーブルの1列と、レコード内での切り出し位置。"""
 
     name: str
@@ -90,7 +103,7 @@ class ChildSpec:
     """1回ぶんのバイト数。``連番`` が1増えるごとに切り出し位置がこれだけ進む。"""
     base: int
     """1回目の先頭オフセット。"""
-    fields: list[Field]
+    fields: list[ColumnCut]
     """ブロック先頭からの相対位置で持つ。"""
 
 
@@ -103,78 +116,39 @@ class TableSpec:
     title: str
     length: int
     keys: list[str]
-    fields: list[Field]
+    fields: list[ColumnCut]
     children: list[ChildSpec] = field(default_factory=list)
 
     @property
     def columns(self) -> list[str]:
-        return [f.name for f in self.fields] + [VERSION_COLUMN]
+        return [cut.name for cut in self.fields] + [VERSION_COLUMN]
+
+    def child_columns(self, child: ChildSpec) -> list[str]:
+        """子テーブルの列。親のキー ＋ 連番 ＋ ブロックの列。"""
+        return self.keys + [SEQ_COLUMN] + [cut.name for cut in child.fields]
 
 
-def _expand(items: Iterable[Item], base: int, prefix: str, out: list[Field]) -> None:
-    """繰返しブロック以外を、連番付きの列として平坦に並べる。"""
-    for item in items:
-        width = len(str(item.repeat))
-        for i in range(item.repeat):
-            off = base + item.offset + i * item.size
-            suffix = "" if item.repeat == 1 else f"_{i + 1:0{width}d}"
-            name = f"{prefix}{item.name}{suffix}"
-            if item.children:
-                _expand(item.children, off, f"{name}_", out)
-            elif item.name != SEPARATOR_NAME:
-                out.append(Field(name, off, item.size))
-
-
-def _dedupe(fields: list[Field]) -> list[Field]:
-    seen: Counter[str] = Counter()
-    for f in fields:
-        seen[f.name] += 1
-        if seen[f.name] > 1:
-            f.name = f"{f.name}#{seen[f.name]}"
-    return fields
+# -- 仕様書の表 → テーブル定義 ---------------------------------------------
 
 
 def build_spec(layout: RecordLayout) -> TableSpec:
     """仕様書の表1つを、親テーブル＋子テーブルの定義に変換する。"""
-    rid = layout.record_id
-    parent: list[Field] = []
+    record_id = layout.record_id
+    parent: list[ColumnCut] = []
     children: list[ChildSpec] = []
     for item in layout.items:
         if item.is_group:
-            fields: list[Field] = []
-            _expand(item.children, 0, "", fields)
-            children.append(
-                ChildSpec(
-                    table=f"{rid.lower()}__{_slug(item.name)}",
-                    repeat=item.repeat,
-                    stride=item.size,
-                    base=item.offset,
-                    fields=_dedupe(fields),
-                )
-            )
+            children.append(_build_child_spec(item, record_id))
         else:
-            _expand([item], 0, "", parent)
-    parent = _dedupe(parent)
+            _collect_cuts([item], 0, "", parent)
+    parent = _suffix_duplicates(parent)
 
-    names = {f.name for f in parent}
-    keys = [i.name for i in layout.items if i.is_key and not i.is_group and i.name in names]
-    for extra in _EXTRA_KEYS.get(rid, ()):
-        if extra in names and extra not in keys:
-            keys.append(extra)
-
-    # 子テーブルは「親のキー ＋ 連番 ＋ ブロックの列」で作る。ブロック側に親のキーと
-    # 同じ名前の列があると（SE の 1着馬情報 は相手馬の血統登録番号を持つ）テーブルを
-    # 作れないので、ブロック側に連番を足して区別する。名前の付け方は仕様書の表内で
-    # 重複したときと同じ規則にそろえる。
-    reserved = set(keys) | {SEQ_COLUMN}
-    for child in children:
-        for f in child.fields:
-            if f.name in reserved:
-                f.name = f"{f.name}#2"
+    keys = _primary_keys(layout, parent)
+    _disambiguate_child_fields(keys, children)
 
     return TableSpec(
-        record_id=rid,
-        table=rid.lower(),
+        record_id=record_id,
+        table=record_id.lower(),
         title=layout.title,
         length=layout.length,
         keys=keys,
@@ -184,7 +158,76 @@ def build_spec(layout: RecordLayout) -> TableSpec:
 
 
 def build_specs(layouts: LayoutSet) -> dict[str, TableSpec]:
-    return {rid: build_spec(lay) for rid, lay in layouts.layouts.items()}
+    return {
+        record_id: build_spec(layout)
+        for record_id, layout in layouts.layouts.items()
+    }
+
+
+def _build_child_spec(item: Item, record_id: str) -> ChildSpec:
+    fields: list[ColumnCut] = []
+    _collect_cuts(item.children, 0, "", fields)
+    return ChildSpec(
+        table=f"{record_id.lower()}__{_slug(item.name)}",
+        repeat=item.repeat,
+        stride=item.size,
+        base=item.offset,
+        fields=_suffix_duplicates(fields),
+    )
+
+
+def _collect_cuts(
+    items: Iterable[Item], base: int, prefix: str, out: list[ColumnCut]
+) -> None:
+    """繰返しブロック以外を、連番付きの列として平坦に並べる。"""
+    for item in items:
+        digits = len(str(item.repeat))
+        for index in range(item.repeat):
+            offset = base + item.offset + index * item.size
+            suffix = "" if item.repeat == 1 else f"_{index + 1:0{digits}d}"
+            name = f"{prefix}{item.name}{suffix}"
+            if item.children:
+                _collect_cuts(item.children, offset, f"{name}_", out)
+            elif item.name != SEPARATOR_NAME:
+                out.append(ColumnCut(name, offset, item.size))
+
+
+def _suffix_duplicates(cuts: list[ColumnCut]) -> list[ColumnCut]:
+    seen: Counter[str] = Counter()
+    for cut in cuts:
+        seen[cut.name] += 1
+        if seen[cut.name] > 1:
+            cut.name = f"{cut.name}#{seen[cut.name]}"
+    return cuts
+
+
+def _primary_keys(layout: RecordLayout, parent: list[ColumnCut]) -> list[str]:
+    """主キーになる列。仕様書のキー列に、時系列オッズ用の追加キーを足す。"""
+    names = {cut.name for cut in parent}
+    keys = [
+        item.name
+        for item in layout.items
+        if item.is_key and not item.is_group and item.name in names
+    ]
+    for extra in _EXTRA_KEYS.get(layout.record_id, ()):
+        if extra in names and extra not in keys:
+            keys.append(extra)
+    return keys
+
+
+def _disambiguate_child_fields(keys: list[str], children: list[ChildSpec]) -> None:
+    """子テーブルの列名が親のキーとぶつからないようにする。
+
+    子テーブルは「親のキー ＋ 連番 ＋ ブロックの列」で作る。ブロック側に親のキーと
+    同じ名前の列があると（SE の 1着馬情報 は相手馬の血統登録番号を持つ）テーブルを
+    作れないので、ブロック側に接尾辞を足して区別する。名前の付け方は仕様書の表内で
+    重複したときと同じ規則にそろえる。
+    """
+    reserved = set(keys) | {SEQ_COLUMN}
+    for child in children:
+        for cut in child.fields:
+            if cut.name in reserved:
+                cut.name = f"{cut.name}{_DUPLICATE_SUFFIX}"
 
 
 class DuckStore:
@@ -212,7 +255,7 @@ class DuckStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.layouts = layouts
         self.specs = build_specs(layouts)
-        self.only = {r.upper() for r in only} if only else None
+        self.only = {record_id.upper() for record_id in only} if only else None
         self.batch = batch
         self.strip = strip
         self.stats: Counter[str] = Counter()
@@ -239,21 +282,32 @@ class DuckStore:
     def _ensure_table(self, spec: TableSpec) -> None:
         if spec.record_id in self._ready:
             return
-        cols = ", ".join(f"{_ident(c)} VARCHAR" for c in spec.columns)
-        pk = ", ".join(_ident(k) for k in spec.keys)
-        constraint = f", PRIMARY KEY ({pk})" if pk else ""
-        self.con.execute(f"CREATE TABLE IF NOT EXISTS {_ident(spec.table)} ({cols}{constraint})")
+        self._create_table(spec.table, spec.columns, spec.keys)
         for child in spec.children:
-            ccols = ", ".join(
-                f"{_ident(k)} VARCHAR" for k in spec.keys
-            ) + f", {_ident(SEQ_COLUMN)} INTEGER, " + ", ".join(
-                f"{_ident(f.name)} VARCHAR" for f in child.fields
-            )
-            cpk = ", ".join(_ident(k) for k in spec.keys + [SEQ_COLUMN])
-            cconstraint = f", PRIMARY KEY ({cpk})" if spec.keys else ""
-            self.con.execute(
-                f"CREATE TABLE IF NOT EXISTS {_ident(child.table)} ({ccols}{cconstraint})"
-            )
+            child_keys = spec.keys + [SEQ_COLUMN] if spec.keys else []
+            self._create_table(child.table, spec.child_columns(child), child_keys)
+        self._record_table_metadata(spec)
+        self._ready.add(spec.record_id)
+
+    def _create_table(
+        self, table: str, columns: Sequence[str], keys: Sequence[str]
+    ) -> None:
+        """全列を VARCHAR で作る。型変換は読む側の責務。"""
+        definitions = ", ".join(
+            f"{_quoted(column)} {self._column_type(column)}" for column in columns
+        )
+        primary_key = ", ".join(_quoted(key) for key in keys)
+        constraint = f", PRIMARY KEY ({primary_key})" if primary_key else ""
+        self.con.execute(
+            f"CREATE TABLE IF NOT EXISTS {_quoted(table)} ({definitions}{constraint})"
+        )
+
+    @staticmethod
+    def _column_type(column: str) -> str:
+        return "INTEGER" if column == SEQ_COLUMN else "VARCHAR"
+
+    def _record_table_metadata(self, spec: TableSpec) -> None:
+        """どのレコード種別がどのテーブルになったかを ``_tables`` に残す。"""
         self.con.execute(
             "INSERT OR REPLACE INTO _tables VALUES (?,?,?,?,?,?)",
             (
@@ -262,50 +316,64 @@ class DuckStore:
                 spec.title,
                 ",".join(spec.keys),
                 len(spec.fields),
-                ",".join(c.table for c in spec.children),
+                ",".join(child.table for child in spec.children),
             ),
         )
-        self._ready.add(spec.record_id)
 
     # -- 書き込み -----------------------------------------------------------
 
     def write(self, raw: bytes) -> str | None:
         """1レコードを該当テーブルの投入待ちに積む。書いた種別IDを返す。"""
-        rid = record_id_of(raw)
-        spec = self.specs.get(rid)
+        record_id = record_id_of(raw)
+        spec = self.specs.get(record_id)
         if spec is None:
-            self.stats["(未知のレコード種別)"] += 1
+            self.stats[UNKNOWN_STATS_KEY] += 1
             return None
-        if self.only is not None and rid not in self.only:
+        if self.only is not None and record_id not in self.only:
             return None
         self._ensure_table(spec)
 
-        if len(raw) < spec.length:
-            raw = raw + b" " * (spec.length - len(raw))
-        cut = self._cut_stripped if self.strip else self._cut_raw
+        raw = padded_record(raw, spec.length)
+        cut_value = self._cut_stripped if self.strip else self._cut_raw
 
-        row = tuple(cut(raw, f.offset, f.size) for f in spec.fields)
-        by_name = dict(zip((f.name for f in spec.fields), row))
+        row = tuple(cut_value(raw, cut.offset, cut.size) for cut in spec.fields)
+        by_name = dict(zip((cut.name for cut in spec.fields), row))
         version = self._version(by_name)
         self._rows.setdefault(spec.table, []).append(row + (version,))
 
-        key_values = tuple(by_name.get(k, "") for k in spec.keys)
+        key_values = tuple(by_name.get(key, "") for key in spec.keys)
         for child in spec.children:
-            rows = self._rows.setdefault(child.table, [])
-            for i in range(child.repeat):
-                base = child.base + i * child.stride
-                values = tuple(cut(raw, base + f.offset, f.size) for f in child.fields)
-                if not any(v.strip("0 ") for v in values):
-                    continue  # 未使用の枠。3連単の 4,896 組は大半が空になる
-                # 版を末尾に付けて運ぶ。同じ取得に訂正が混ざったとき、
-                # 子も親と同じ版が勝つようにするために要る（挿入時は落とす）。
-                rows.append(key_values + (i + 1,) + values + (version,))
+            self._rows.setdefault(child.table, []).extend(
+                self._child_rows(raw, child, key_values, version, cut_value)
+            )
 
-        self.stats[rid] += 1
+        self.stats[record_id] += 1
         self._pending += 1
         if self._pending >= self.batch:
             self.flush()
-        return rid
+        return record_id
+
+    @staticmethod
+    def _child_rows(
+        raw: bytes,
+        child: ChildSpec,
+        key_values: tuple[str, ...],
+        version: str,
+        cut_value: CutValue,
+    ) -> list[tuple]:
+        """繰返しブロックを縦持ちの行に開く。未使用の枠は行にしない。"""
+        rows: list[tuple] = []
+        for index in range(child.repeat):
+            base = child.base + index * child.stride
+            values = tuple(
+                cut_value(raw, base + cut.offset, cut.size) for cut in child.fields
+            )
+            if not any(value.strip("0 ") for value in values):
+                continue  # 未使用の枠。3連単の 4,896 組は大半が空になる
+            # 版を末尾に付けて運ぶ。同じ取得に訂正が混ざったとき、
+            # 子も親と同じ版が勝つようにするために要る（挿入時は落とす）。
+            rows.append(key_values + (index + 1,) + values + (version,))
+        return rows
 
     @staticmethod
     def _cut_stripped(raw: bytes, offset: int, size: int) -> str:
@@ -337,18 +405,18 @@ class DuckStore:
 
     def _merge(self, spec: TableSpec, rows: Sequence[tuple]) -> None:
         """親を当ててから、勝った親の子だけを入れ替える。"""
-        table = _ident(spec.table)
+        table = _quoted(spec.table)
         self._insert("tmp_parent", spec.columns, rows)
         if not spec.keys:
             # キーの定義がない表。重複判定ができないので素直に追記する。
             self.con.execute(f"INSERT INTO {table} SELECT * FROM tmp_parent")
             self.con.execute("DROP TABLE tmp_parent")
-            self._drop_child_rows(spec)
+            self._append_child_rows(spec)
             return
 
-        keys = ", ".join(_ident(k) for k in spec.keys)
-        on = " AND ".join(f"t.{_ident(k)} = s.{_ident(k)}" for k in spec.keys)
-        version = _ident(VERSION_COLUMN)
+        keys = ", ".join(_quoted(key) for key in spec.keys)
+        on_keys = self._join_condition(spec.keys, "t", "s")
+        version = _quoted(VERSION_COLUMN)
         # 同じ取得の中に同一キーが複数入ることがある（訂正が同じファイルに来る）。
         # キーごとに最新版へ落としてから当てる。
         self.con.execute(
@@ -359,10 +427,10 @@ class DuckStore:
         # 置き換えないキーは tmp_won から外し、子テーブルも触らない。
         self.con.execute(
             f"CREATE OR REPLACE TEMP TABLE tmp_won AS SELECT s.* FROM tmp_latest s "
-            f"WHERE NOT EXISTS (SELECT 1 FROM {table} t WHERE {on} "
+            f"WHERE NOT EXISTS (SELECT 1 FROM {table} t WHERE {on_keys} "
             f"                  AND t.{version} > s.{version})"
         )
-        self.con.execute(f"DELETE FROM {table} t USING tmp_won s WHERE {on}")
+        self.con.execute(f"DELETE FROM {table} t USING tmp_won s WHERE {on_keys}")
         self.con.execute(f"INSERT INTO {table} SELECT * FROM tmp_won")
 
         for child in spec.children:
@@ -373,43 +441,56 @@ class DuckStore:
 
     def _merge_child(self, spec: TableSpec, child: ChildSpec) -> None:
         rows = self._rows.get(child.table)
-        table = _ident(child.table)
-        parent_on = " AND ".join(f"t.{_ident(k)} = s.{_ident(k)}" for k in spec.keys)
+        table = _quoted(child.table)
         # 親が入れ替わったら子は丸ごと入れ替える。頭数が減ったときに
         # 前回の組が残るのを防ぐため、消してから入れ直す。
+        parent_on = self._join_condition(spec.keys, "t", "s")
         self.con.execute(f"DELETE FROM {table} t USING tmp_won s WHERE {parent_on}")
         if not rows:
             return
-        cols = spec.keys + [SEQ_COLUMN] + [f.name for f in child.fields]
-        self._insert("tmp_child", cols + [VERSION_COLUMN], rows, seq_index=len(spec.keys))
-        keys = ", ".join(f"c.{_ident(k)}" for k in spec.keys + [SEQ_COLUMN])
-        select = ", ".join(f"c.{_ident(c)}" for c in cols)
-        join = " AND ".join(f"c.{_ident(k)} = w.{_ident(k)}" for k in spec.keys)
+        columns = spec.child_columns(child)
+        self._insert("tmp_child", columns + [VERSION_COLUMN], rows,
+                     seq_index=len(spec.keys))
+        partition = ", ".join(
+            f"c.{_quoted(key)}" for key in spec.keys + [SEQ_COLUMN]
+        )
+        select = ", ".join(f"c.{_quoted(column)}" for column in columns)
+        join = self._join_condition(spec.keys, "c", "w")
+        version = _quoted(VERSION_COLUMN)
         # 親の勝った版に対応する子だけを入れる。
         self.con.execute(
             f"INSERT INTO {table} SELECT {select} FROM tmp_child c JOIN tmp_won w "
-            f"ON {join} AND c.{_ident(VERSION_COLUMN)} = w.{_ident(VERSION_COLUMN)} "
-            f"QUALIFY row_number() OVER (PARTITION BY {keys}) = 1"
+            f"ON {join} AND c.{version} = w.{version} "
+            f"QUALIFY row_number() OVER (PARTITION BY {partition}) = 1"
         )
         self.con.execute("DROP TABLE tmp_child")
         rows.clear()
 
-    def _drop_child_rows(self, spec: TableSpec) -> None:
+    def _append_child_rows(self, spec: TableSpec) -> None:
+        """キーの定義がない表の子。重複判定ができないので素直に追記する。"""
         for child in spec.children:
             rows = self._rows.get(child.table)
-            if rows:
-                cols = spec.keys + [SEQ_COLUMN] + [f.name for f in child.fields]
-                self._insert("tmp_child", cols + [VERSION_COLUMN], rows, seq_index=len(spec.keys))
-                select = ", ".join(_ident(c) for c in cols)
-                self.con.execute(
-                    f"INSERT INTO {_ident(child.table)} SELECT {select} FROM tmp_child"
-                )
-                self.con.execute("DROP TABLE tmp_child")
-                rows.clear()
+            if not rows:
+                continue
+            columns = spec.child_columns(child)
+            self._insert("tmp_child", columns + [VERSION_COLUMN], rows,
+                         seq_index=len(spec.keys))
+            select = ", ".join(_quoted(column) for column in columns)
+            self.con.execute(
+                f"INSERT INTO {_quoted(child.table)} SELECT {select} FROM tmp_child"
+            )
+            self.con.execute("DROP TABLE tmp_child")
+            rows.clear()
+
+    @staticmethod
+    def _join_condition(keys: Sequence[str], left: str, right: str) -> str:
+        return " AND ".join(
+            f"{left}.{_quoted(key)} = {right}.{_quoted(key)}" for key in keys
+        )
 
     def _insert(
         self,
-        name: str,
+        table_name: str,
         columns: Sequence[str],
         rows: Sequence[tuple],
         *,
@@ -425,28 +506,36 @@ class DuckStore:
         JV-Data の空欄は「値が空」であって「値が無い」ではないので、
         仕様書の桁のままの文字列として保つ。
         """
-        fd, tmp = tempfile.mkstemp(suffix=".csv", prefix="jvstore_")
+        handle, temp_path = tempfile.mkstemp(suffix=".csv", prefix="jvstore_")
         try:
-            with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f, quoting=csv.QUOTE_ALL).writerows(rows)
+            with os.fdopen(handle, "w", newline="", encoding="utf-8") as stream:
+                csv.writer(stream, quoting=csv.QUOTE_ALL).writerows(rows)
             source = ", ".join(f"'c{i}': 'VARCHAR'" for i in range(len(columns)))
             select = ", ".join(
-                (f"CAST(c{i} AS INTEGER)" if seq_index is not None and i == seq_index else f"c{i}")
-                + f" AS {_ident(c)}"
-                for i, c in enumerate(columns)
+                f"{self._cast(index, seq_index)} AS {_quoted(column)}"
+                for index, column in enumerate(columns)
             )
             self.con.execute(
-                f"CREATE OR REPLACE TEMP TABLE {name} AS SELECT {select} FROM "
+                f"CREATE OR REPLACE TEMP TABLE {table_name} AS SELECT {select} FROM "
                 f"read_csv(?, header=false, allow_quoted_nulls=false, columns={{{source}}})",
-                [Path(tmp).as_posix()],
+                [Path(temp_path).as_posix()],
             )
         finally:
-            os.unlink(tmp)
+            os.unlink(temp_path)
+
+    @staticmethod
+    def _cast(index: int, seq_index: int | None) -> str:
+        """連番の列だけ整数にする。ほかは仕様書の桁のままの文字列で保つ。"""
+        if seq_index is not None and index == seq_index:
+            return f"CAST(c{index} AS INTEGER)"
+        return f"c{index}"
 
     # -- メタ情報 -----------------------------------------------------------
 
     def meta(self, key: str, default: Any = None) -> Any:
-        row = self.con.execute("SELECT value FROM _meta WHERE key = ?", [key]).fetchone()
+        row = self.con.execute(
+            "SELECT value FROM _meta WHERE key = ?", [key]
+        ).fetchone()
         return row[0] if row else default
 
     def set_meta(self, key: str, value: str) -> None:
@@ -458,13 +547,16 @@ class DuckStore:
 
     def counts(self) -> dict[str, int]:
         """テーブルごとの行数。取得結果の確認に使う。"""
-        out: dict[str, int] = {}
-        for (name,) in self.con.execute(
+        rows = self.con.execute(
             "SELECT table_name FROM duckdb_tables() WHERE NOT starts_with(table_name, '_') "
             "ORDER BY table_name"
-        ).fetchall():
-            out[name] = self.con.execute(f"SELECT count(*) FROM {_ident(name)}").fetchone()[0]
-        return out
+        ).fetchall()
+        return {
+            name: self.con.execute(
+                f"SELECT count(*) FROM {_quoted(name)}"
+            ).fetchone()[0]
+            for (name,) in rows
+        }
 
     def close(self) -> None:
         self.flush()

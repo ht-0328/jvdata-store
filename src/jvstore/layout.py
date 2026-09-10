@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from functools import cache
 from importlib import resources
 from pathlib import Path
 from typing import Any, Iterator
@@ -61,7 +62,7 @@ class Item:
         return self.size * self.repeat
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
+        as_dict: dict[str, Any] = {
             "no": self.no,
             "name": self.name,
             "offset": self.offset,
@@ -72,21 +73,21 @@ class Item:
             "comment": self.comment,
         }
         if self.children:
-            d["children"] = [c.to_dict() for c in self.children]
-        return d
+            as_dict["children"] = [child.to_dict() for child in self.children]
+        return as_dict
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "Item":
+    def from_dict(cls, data: dict[str, Any]) -> "Item":
         return cls(
-            no=d["no"],
-            name=d["name"],
-            offset=d["offset"],
-            size=d["size"],
-            repeat=d.get("repeat", 1),
-            is_key=d.get("is_key", False),
-            default=d.get("default", ""),
-            comment=d.get("comment", ""),
-            children=[cls.from_dict(c) for c in d.get("children", ())],
+            no=data["no"],
+            name=data["name"],
+            offset=data["offset"],
+            size=data["size"],
+            repeat=data.get("repeat", 1),
+            is_key=data.get("is_key", False),
+            default=data.get("default", ""),
+            comment=data.get("comment", ""),
+            children=[cls.from_dict(child) for child in data.get("children", ())],
         )
 
 
@@ -119,17 +120,17 @@ class RecordLayout:
             "title": self.title,
             "record_id": self.record_id,
             "length": self.length,
-            "items": [i.to_dict() for i in self.items],
+            "items": [item.to_dict() for item in self.items],
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "RecordLayout":
+    def from_dict(cls, data: dict[str, Any]) -> "RecordLayout":
         return cls(
-            index=d["index"],
-            title=d["title"],
-            record_id=d["record_id"],
-            length=d["length"],
-            items=[Item.from_dict(i) for i in d["items"]],
+            index=data["index"],
+            title=data["title"],
+            record_id=data["record_id"],
+            length=data["length"],
+            items=[Item.from_dict(item) for item in data["items"]],
         )
 
 
@@ -152,12 +153,12 @@ class DataSpec:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "DataSpec":
+    def from_dict(cls, data: dict[str, Any]) -> "DataSpec":
         return cls(
-            id=d["id"],
-            name=d["name"],
-            categories=list(d.get("categories", ())),
-            record_ids=list(d.get("record_ids", ())),
+            id=data["id"],
+            name=data["name"],
+            categories=list(data.get("categories", ())),
+            record_ids=list(data.get("record_ids", ())),
         )
 
 
@@ -183,8 +184,8 @@ class LayoutSet:
         return {
             "version": self.version,
             "source": self.source,
-            "layouts": [l.to_dict() for l in self.layouts.values()],
-            "dataspecs": [d.to_dict() for d in self.dataspecs.values()],
+            "layouts": [layout.to_dict() for layout in self.layouts.values()],
+            "dataspecs": [spec.to_dict() for spec in self.dataspecs.values()],
         }
 
     def dump(self, path: Path) -> None:
@@ -194,27 +195,29 @@ class LayoutSet:
         )
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "LayoutSet":
-        layouts = [RecordLayout.from_dict(x) for x in d["layouts"]]
-        specs = [DataSpec.from_dict(x) for x in d.get("dataspecs", ())]
+    def from_dict(cls, data: dict[str, Any]) -> "LayoutSet":
+        layouts = [RecordLayout.from_dict(entry) for entry in data["layouts"]]
+        specs = [DataSpec.from_dict(entry) for entry in data.get("dataspecs", ())]
         return cls(
-            version=d.get("version", ""),
-            source=d.get("source", ""),
-            layouts={l.record_id: l for l in layouts},
-            dataspecs={s.id: s for s in specs},
+            version=data.get("version", ""),
+            source=data.get("source", ""),
+            layouts={layout.record_id: layout for layout in layouts},
+            dataspecs={spec.id: spec for spec in specs},
         )
 
 
 _DEFAULT_RESOURCE = "layouts.json"
-_cache: LayoutSet | None = None
 
 
 def load_layouts(path: Path | None = None) -> LayoutSet:
     """レイアウト定義を読み込む（既定はパッケージ同梱の layouts.json）。"""
-    global _cache
-    if path is not None:
-        return LayoutSet.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
-    if _cache is None:
-        res = resources.files("jvstore.resources").joinpath(_DEFAULT_RESOURCE)
-        _cache = LayoutSet.from_dict(json.loads(res.read_text(encoding="utf-8")))
-    return _cache
+    if path is None:
+        return _bundled_layouts()
+    return LayoutSet.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+@cache
+def _bundled_layouts() -> LayoutSet:
+    """同梱の layouts.json。38 表ぶんの解析結果を毎回作り直さないよう覚えておく。"""
+    resource = resources.files("jvstore.resources").joinpath(_DEFAULT_RESOURCE)
+    return LayoutSet.from_dict(json.loads(resource.read_text(encoding="utf-8")))

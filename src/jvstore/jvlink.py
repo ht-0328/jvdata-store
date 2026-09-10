@@ -57,6 +57,15 @@ _ERRORS: dict[int, str] = {
 }
 
 
+#: JVGets の戻り値のうち、レコード以外を表すもの。
+_GETS_EOF = 0
+_GETS_NEXT_FILE = -1
+_GETS_DOWNLOADING = -3
+
+#: JVOpen が「該当データ無し」を表す戻り値。エラーにはしない。
+_OPEN_NO_DATA = -1
+
+
 def describe_error(code: int) -> str:
     return _ERRORS.get(code, "未定義のエラーコード")
 
@@ -114,9 +123,9 @@ class JVLink:
     # ------------------------------------------------------------------ 基本
     def init(self) -> None:
         """JVInit。他のメソッドより先に必ず 1 回呼ぶ。"""
-        ret = int(self._com.JVInit(self.sid))
-        if ret != 0:
-            raise JVLinkError("JVInit", ret)
+        code = int(self._com.JVInit(self.sid))
+        if code != 0:
+            raise JVLinkError("JVInit", code)
 
     def set_ui_properties(self) -> None:
         """JV-Link の設定ダイアログ（利用キー登録・利用規約同意）を開く。"""
@@ -137,7 +146,7 @@ class JVLink:
         self._com.JVCancel()
 
     def dispose(self) -> None:
-        """Release COM on the creating thread when this instance will not be reused."""
+        """このインスタンスを使い終えたとき、COM を作ったスレッドで解放する。"""
         if self._disposed:
             return
         try:
@@ -150,9 +159,9 @@ class JVLink:
             pythoncom.CoUninitialize()
 
     def file_delete(self, filename: str) -> None:
-        ret = int(self._com.JVFiledelete(filename))
-        if ret != 0:
-            raise JVLinkError("JVFiledelete", ret)
+        code = int(self._com.JVFiledelete(filename))
+        if code != 0:
+            raise JVLinkError("JVFiledelete", code)
 
     def __enter__(self) -> "JVLink":
         self.init()
@@ -168,24 +177,26 @@ class JVLink:
         option は 1:通常 2:今週 3:セットアップ 4:ダイアログ無しセットアップ。
         戻り値 -1（該当データ無し）は例外にせず read_count=0 として返す。
         """
-        ret = self._com.JVOpen(dataspec, fromtime, int(option), 0, 0, "")
-        code = int(ret[0]) if isinstance(ret, (list, tuple)) else int(ret)
-        if code == -1:
-            self._opened = True  # -1 でも JVClose は必要
+        returned = self._com.JVOpen(dataspec, fromtime, int(option), 0, 0, "")
+        code = (
+            int(returned[0]) if isinstance(returned, (list, tuple)) else int(returned)
+        )
+        if code == _OPEN_NO_DATA:
+            self._opened = True  # 該当データ無しでも JVClose は必要
             return OpenResult(0, 0, "")
         if code != 0:
             raise JVLinkError("JVOpen", code)
         self._opened = True
         return OpenResult(
-            read_count=int(ret[1] or 0),
-            download_count=int(ret[2] or 0),
-            last_file_timestamp=str(ret[3] or ""),
+            read_count=int(returned[1] or 0),
+            download_count=int(returned[2] or 0),
+            last_file_timestamp=str(returned[3] or ""),
         )
 
     def rt_open(self, dataspec: str, key: str) -> None:
         """速報系データの取得要求（JVRTOpen）。dataspec は 4 桁固定、key は提供単位に応じて指定。"""
         code = int(self._com.JVRTOpen(dataspec, key))
-        if code == -1:
+        if code == _OPEN_NO_DATA:
             self._opened = True
             return
         if code != 0:
@@ -208,13 +219,15 @@ class JVLink:
 
         コードは >0:読み込んだバイト数 / 0:EOF / -1:ファイル切り替わり / -3:ダウンロード中。
         """
-        buff = bytearray(self.BUFFER_SIZE)
-        ret, mem, fname = self._com.JVGets(buff, self.BUFFER_SIZE, bytearray())
-        code = int(ret)
+        buffer = bytearray(self.BUFFER_SIZE)
+        returned, memory, filename = self._com.JVGets(
+            buffer, self.BUFFER_SIZE, bytearray()
+        )
+        code = int(returned)
         # 戻り値はバッファにセットされたデータのサイズ。バッファ全体が返るので
         # 必ず code バイトで切り詰める（残りは未初期化の 0x00 が並ぶ）。
-        data = mem.tobytes()[:code] if code > 0 and mem is not None else b""
-        return code, data, str(fname or "")
+        data = memory.tobytes()[:code] if code > 0 and memory is not None else b""
+        return code, data, str(filename or "")
 
     def wait_download(
         self,
@@ -240,17 +253,17 @@ class JVLink:
     ) -> Iterator[ReadRecord]:
         """EOF まで JVGets を繰り返し、1 レコードずつ返すイテレータ。"""
         while True:
-            code, data, fname = self.gets()
+            code, data, filename = self.gets()
             if code > 0:
-                yield ReadRecord(data, fname)
-            elif code == -1:
+                yield ReadRecord(data, filename)
+            elif code == _GETS_NEXT_FILE:
                 # ファイル切り替わり。エラーではないので読み込みを続ける。
                 if on_file:
-                    on_file(fname)
-            elif code == -3:
+                    on_file(filename)
+            elif code == _GETS_DOWNLOADING:
                 # 読み出そうとするファイルがまだダウンロード中。
                 time.sleep(retry_interval)
-            elif code == 0:
+            elif code == _GETS_EOF:
                 return
             else:
                 raise JVLinkError("JVGets", code)

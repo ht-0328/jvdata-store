@@ -7,15 +7,29 @@ JV-Data は「全角＝Shift_JIS 2 バイト / 半角＝1 バイト」の固定�
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable
 
 from .layout import Item, RecordLayout
 
-__all__ = ["Column", "FlatLayout", "record_id_of", "SEPARATOR_NAME"]
+__all__ = [
+    "Column",
+    "FlatLayout",
+    "record_id_of",
+    "padded_record",
+    "SEPARATOR_NAME",
+    "UNKNOWN_STATS_KEY",
+]
 
 SEPARATOR_NAME = "レコード区切"
 ENCODING = "cp932"
+
+#: レイアウト定義に無いレコード種別の件数を数える、書き出し側の ``stats`` のキー。
+UNKNOWN_STATS_KEY = "(未知のレコード種別)"
+
+#: レコード長に足りないぶんを埋める文字。JV-Data の初期値と同じ半角スペース。
+_PADDING = b" "
 
 
 @dataclass(slots=True)
@@ -44,9 +58,9 @@ class FlatLayout:
         self.layout = layout
         self.keep_separator = keep_separator
         self.columns = [
-            c
-            for c in _build_columns(layout)
-            if keep_separator or c.name != SEPARATOR_NAME
+            column
+            for column in _build_columns(layout)
+            if keep_separator or column.name != SEPARATOR_NAME
         ]
 
     @property
@@ -58,49 +72,59 @@ class FlatLayout:
         return self.layout.slug
 
     def header(self) -> list[str]:
-        return [c.name for c in self.columns]
+        return [column.name for column in self.columns]
 
     def key_columns(self) -> list[str]:
-        return [c.name for c in self.columns if c.is_key]
+        return [column.name for column in self.columns if column.is_key]
 
     def parse(self, raw: bytes, *, strip: bool = True) -> list[str]:
         """1 レコード分の bytes をカラム値のリストにする。
 
         レコード長が足りない場合は半角スペースで埋める（JV-Data の初期値と同じ扱い）。
         """
-        need = self.layout.length
-        if len(raw) < need:
-            raw = raw + b" " * (need - len(raw))
-        out = []
-        for c in self.columns:
-            v = raw[c.offset : c.offset + c.size].decode(ENCODING, errors="replace")
-            out.append(v.rstrip() if strip else v)
-        return out
+        raw = padded_record(raw, self.layout.length)
+        values = []
+        for column in self.columns:
+            text = raw[column.offset : column.offset + column.size].decode(
+                ENCODING, errors="replace"
+            )
+            values.append(text.rstrip() if strip else text)
+        return values
 
     def parse_dict(self, raw: bytes, *, strip: bool = True) -> dict[str, str]:
         return dict(zip(self.header(), self.parse(raw, strip=strip)))
 
 
+def padded_record(raw: bytes, length: int) -> bytes:
+    """レコード長に足りないぶんを埋める。JV-Data の初期値と同じ半角スペースを使う。"""
+    if len(raw) >= length:
+        return raw
+    return raw + _PADDING * (length - len(raw))
+
+
 def _build_columns(layout: RecordLayout) -> list[Column]:
-    cols: list[Column] = []
-    _walk(layout.items, 0, "", cols)
-    return _dedupe(cols)
+    columns: list[Column] = []
+    _collect_columns(layout.items, 0, "", columns)
+    return _suffix_duplicates(columns)
 
 
-def _walk(items: Iterable[Item], base: int, prefix: str, out: list[Column]) -> None:
+def _collect_columns(
+    items: Iterable[Item], base: int, prefix: str, out: list[Column]
+) -> None:
+    """項目を再帰的にたどり、末端の項目だけをカラムとして並べる。"""
     for item in items:
-        width = len(str(item.repeat))
-        for i in range(item.repeat):
-            off = base + item.offset + i * item.size
-            suffix = "" if item.repeat == 1 else f"_{i + 1:0{width}d}"
+        digits = len(str(item.repeat))
+        for index in range(item.repeat):
+            offset = base + item.offset + index * item.size
+            suffix = "" if item.repeat == 1 else f"_{index + 1:0{digits}d}"
             name = f"{prefix}{item.name}{suffix}"
             if item.children:
-                _walk(item.children, off, f"{name}_", out)
+                _collect_columns(item.children, offset, f"{name}_", out)
             else:
                 out.append(
                     Column(
                         name=name,
-                        offset=off,
+                        offset=offset,
                         size=item.size,
                         is_key=item.is_key,
                         item_no=item.no,
@@ -109,14 +133,14 @@ def _walk(items: Iterable[Item], base: int, prefix: str, out: list[Column]) -> N
                 )
 
 
-def _dedupe(cols: list[Column]) -> list[Column]:
-    seen: dict[str, int] = {}
-    for c in cols:
-        n = seen.get(c.name, 0) + 1
-        seen[c.name] = n
-        if n > 1:
-            c.name = f"{c.name}#{n}"
-    return cols
+def _suffix_duplicates(columns: list[Column]) -> list[Column]:
+    """同名カラムの 2 つめ以降に ``#2`` を付ける。仕様書の表内で名前が重複する。"""
+    seen: Counter[str] = Counter()
+    for column in columns:
+        seen[column.name] += 1
+        if seen[column.name] > 1:
+            column.name = f"{column.name}#{seen[column.name]}"
+    return columns
 
 
 def record_id_of(raw: bytes) -> str:
