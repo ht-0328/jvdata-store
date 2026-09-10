@@ -1,5 +1,7 @@
-"""?????????????????"""
+"""取得のように時間のかかる処理を別スレッドで動かし、進捗とログを持つ。"""
+
 from __future__ import annotations
+
 import contextlib
 import os
 import subprocess
@@ -8,8 +10,12 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+#: ログの保持行数。1年ぶんの取得は1,300行以上出るので、全部は持たない。
 MAX_LOG_LINES = 400
+#: 画面に返す行数（末尾のみ）。
 TAIL_LINES = 40
+
 
 def _decode(raw: bytes) -> str:
     """子プロセスの1行を文字列にする。

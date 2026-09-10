@@ -8,9 +8,8 @@ import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
-from urllib.parse import urlparse
 
 import duckdb
 
@@ -129,7 +128,7 @@ def make_handler(backend: Backend):
                 return self._json({"error": str(error)}, 409)
             except (ValueError, LookupError) as error:
                 return self._json({"error": str(error)}, 400)
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001  画面に理由を返し、サーバは止めない
                 return self._json({"error": str(error)}, 500)
 
         def do_POST(self):
@@ -154,7 +153,7 @@ def make_handler(backend: Backend):
                     years, requested, force_setup=force == "1")})
             except ValueError as error:
                 return self._json({"error": str(error)}, 400)
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001  画面に理由を返し、サーバは止めない
                 return self._json({"error": str(error)}, 500)
 
     return Handler
@@ -175,7 +174,7 @@ def serve(db: Path, port: int = DEFAULT_PORT, open_browser: bool = False):
             with urlopen(url + "api/info", timeout=2) as response:
                 info = json.load(response)
             same = info.get("app") == "jvdata-store" and Path(info["db"]).resolve() == backend.db
-        except Exception:
+        except Exception:  # noqa: BLE001  応答が読めなければ別の画面とみなす
             same = False
         if not same:
             raise SystemExit(f"ポート {port} は別の画面で使用中です。--port で変更してください。") from error
