@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>jvstore — JRA-VANデータ取得・管理</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Old+Mincho:wght@400;600;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #100e0b;        /* 画面の地 */
+    --panel: #1a1712;     /* カード */
+    --panel-2: #16130f;   /* ヘッダ・サイドバー（地より沈める） */
+    --panel-3: #1e1a15;   /* カードの中のカード */
+    --line: #332c22;
+    --line-2: #2a241c;
+    --fg: #f2ece1;
+    --fg-2: #d9d0c4;
+    --muted: #a1968a;
+    --muted-2: #8b8177;   /* 最小の注記。これより暗い色は使わない（4.68:1） */
+    --chip: #221d17;
+    --chip-line: #3a332a;
+
+    --gold: #d8b268;
+    --green: #8fc9a0;
+    --red: #e0765f;
+
+    --serif: "Zen Old Mincho", "Yu Mincho", "Hiragino Mincho ProN", serif;
+    --sans: "Zen Kaku Gothic New", "Hiragino Sans", "Yu Gothic UI", Meiryo, system-ui, sans-serif;
+    --mono: "IBM Plex Mono", "Cascadia Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: var(--sans); font-size: 14px; line-height: 1.75;
+  }
+  ::selection { background: rgba(216,178,104,.3); }
+  .muted { color: var(--muted); }
+  .grow { flex: 1; }
+
+  header {
+    position: sticky; top: 0; z-index: 10; background: var(--panel-2);
+    border-bottom: 1px solid var(--line); padding: 10px 18px;
+    display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  }
+  header h1 {
+    font-family: var(--serif); font-size: 19px; font-weight: 600;
+    letter-spacing: .04em; margin: 0 4px 0 0;
+  }
+  button, select, input {
+    font: inherit; font-size: 13px; color: var(--fg); background: var(--chip);
+    border: 1px solid var(--chip-line); border-radius: 6px; padding: 5px 11px;
+    cursor: pointer;
+  }
+  input[type=date] { font-family: var(--mono); }
+  button:hover:not(:disabled) { border-color: var(--green); }
+  button:disabled { opacity: .45; cursor: default; }
+
+  .layout { display: grid; grid-template-columns: minmax(300px, 380px) 1fr; }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  /* -- カード ------------------------------------------------------------ */
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 10px; padding: 14px 18px; margin-bottom: 14px; }
+  .card h2 { font-family: var(--serif); font-size: 17px; font-weight: 600;
+             margin: 0 0 8px; }
+  .kv { display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; }
+  .hint { font-size: 12px; color: var(--muted-2); line-height: 1.7; }
+  pre { margin: 0; font-family: var(--mono); font-size: 12px;
+        white-space: pre-wrap; word-break: break-word; }
+
+  #acquisition { margin: 16px 18px; }
+  #acquisition[hidden] { display: none; }
+  .fetch-controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  #hfetch { border-color: var(--gold); color: var(--gold); font-weight: 700; }
+  #data-message { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #task-status { font-weight: 700; margin-bottom: 6px; }
+
+  /* -- 実行ログ ---------------------------------------------- */
+  #taskbar, #specbar { border-bottom: 1px solid var(--line);
+                         background: var(--panel-2); padding: 8px 18px; }
+  #specbar[hidden], #taskbar[hidden] { display: none; }
+  #specbar label { display: inline-block; margin: 2px 14px 2px 0; white-space: nowrap; }
+  #taskbar pre { max-height: 160px; overflow: auto; background: #13100d;
+                 border-radius: 6px; padding: 9px 11px; color: var(--muted); }
+
+  /* -- 過去データ -------------------------------------------------------- */
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 6px 9px; border-bottom: 1px solid var(--line-2);
+           vertical-align: top; }
+  th { text-align: left; font-size: 12px; color: var(--muted-2); font-weight: 600;
+       position: sticky; top: 0; background: var(--panel-2); }
+  #tablist { border-right: 1px solid var(--line); max-height: calc(100vh - 56px);
+             overflow: auto; background: var(--panel-2); }
+  .tbl { padding: 9px 14px; border-bottom: 1px solid var(--line-2); cursor: pointer;
+         border-left: 2px solid transparent; }
+  .tbl:hover { background: var(--panel-3); }
+  .tbl.sel { background: var(--panel-3); border-left-color: var(--gold); }
+  .id { font-family: var(--mono); font-weight: 600; margin-right: 7px;
+        color: var(--gold); }
+  .tbl .sub { font-family: var(--mono); font-size: 11px; color: var(--muted-2); }
+  .tbl.empty { opacity: .5; }
+  #griddetail { padding: 20px 24px; max-height: calc(100vh - 56px); overflow: auto; }
+  .gridwrap { overflow: auto; max-height: calc(100vh - 280px);
+              border: 1px solid var(--line); border-radius: 8px;
+              background: var(--panel); }
+  .gridwrap table { font-family: var(--mono); font-size: 12px;
+                    width: max-content; min-width: 100%; }
+  .gridwrap th { white-space: nowrap; z-index: 2; }
+  .gridwrap td { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .gridwrap td:first-child, .gridwrap th:first-child {
+    position: sticky; left: 0; background: var(--panel-2); z-index: 1;
+    color: var(--muted-2); text-align: right; }
+  .gridwrap th:first-child { z-index: 3; }
+  .pager { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+           margin: 12px 0; font-size: 13px; font-family: var(--mono); }
+</style>
+</head>
+<body>
+<header><h1>jvstore</h1><span class="muted">JRA-VAN データ取得・管理</span><span class="grow"></span><span id="summary" class="muted"></span></header>
+<section id="acquisition" class="card">
+  <h2>JRA-VAN データ取得</h2>
+  <p class="hint">過去のレース・競走馬・血統・調教などを取得します。初回は指定年数ぶん、2回目からは前回以降の更新を取り込みます。</p>
+  <div class="fetch-controls">
+    <label>過去 <input id="hyears" type="number" min="1" max="40" step="1" value="10" style="width:5em"> 年ぶん</label>
+    <button id="hspecs">データ種別を選ぶ</button>
+    <button id="hfetch">取得する</button>
+    <button id="hsetup">JV-Link設定</button>
+  </div>
+  <p><label><input id="hforce" type="checkbox"> 期間を広げて再取得する</label><br>
+    <span class="hint">例：1年取得済みで10年に広げる場合はチェックしてください。年数の変更だけでは古い年は追加されません。</span></p>
+  <div id="specbar" hidden></div>
+  <p id="data-message" class="hint" role="status"></p>
+  <p class="hint">初回や再取得は数十分〜数時間、保存容量は数GBになることがあります。取得中はデータの閲覧・予想を待機します。<br>
+    利用キーが未登録なら「JV-Link設定」で登録してください。設定画面はこのPCに開きます。</p>
+</section>
+<div id="taskbar" hidden><div id="task-status" role="status"></div><pre id="log"></pre></div>
+
+<div class="fetch-controls" style="padding:12px 18px">
+<span class="muted">取得済みデータを開催日で絞り込み</span>
+<input id="hfrom" type="date" aria-label="開催日 開始"><span>〜</span><input id="hto" type="date" aria-label="開催日 終了">
+<button id="hreload">一覧を更新</button></div>
+<div id="view-history" class="view layout">
+  <div id="tablist"></div>
+  <div id="griddetail"><p class="muted">左の表を選ぶと中身が見られます。</p></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let taskRunning = false, polling = null;
+const BUSY_BUTTONS = ["#hfetch", "#hreload", "#hsetup"];
+
+function setBusy(running){
+  taskRunning = running;
+  for (const b of BUSY_BUTTONS) $(b).disabled = running;
+}
+
+function refreshView(){
+  loadTables(); loadGrid();
+}
+
+function renderTask(t){
+  setBusy(t.running);
+  $("#taskbar").hidden = t.status === "idle";
+  $("#task-status").textContent = `${t.label} — ${
+    t.running ? "実行中" : t.status === "failed" ? "失敗：ログを確認してください" : "完了"}`;
+  $("#task-status").style.color = t.status === "failed" ? "var(--red)" : "var(--green)";
+  $("#log").textContent = t.log.join("\n");
+  $("#log").scrollTop = $("#log").scrollHeight;
+}
+
+async function pollTask(){
+  try {
+    const response = await fetch("/api/task");
+    const t = await response.json();
+    if (!response.ok || t.error) throw new Error(t.error || "進捗を取得できません");
+    renderTask(t);
+    if (t.running) polling = setTimeout(pollTask, 800);
+    else { polling = null; refreshView(); }
+  } catch (error) {
+    $("#taskbar").hidden = false;
+    $("#task-status").textContent = `接続を再確認しています：${error.message}`;
+    polling = setTimeout(pollTask, 3000);
+  }
+}
+
+/** 取得系はどれも時間がかかるので、ログを出して終わるまでボタンを止める。 */
+async function runTask(url){
+  if (taskRunning) return;
+  setBusy(true);
+  try {
+    const response = await fetch(url, {method: "POST"});
+    const r = await response.json();
+    if (!response.ok || r.error) throw new Error(r.error || "開始できませんでした");
+    if (!r.started) $("#task-status").textContent = "実行中の処理を表示します";
+  } catch (error) {
+    alert(error.message);
+  }
+  // 通信が切れてもサーバでは開始済みの可能性があるため状態を読み直す。
+  if (polling) clearTimeout(polling);
+  await pollTask();
+}
+
+let tables = [], curTable = null, gridState = {offset: 0, colOffset: 0};
+
+// 取得するデータ種別。既定は全部。使わない表を外すと容量と時間が減る。
+let specs = [], specOn = new Set();
+
+async function loadSpecs(){
+  if (specs.length) return;
+  const d = await (await fetch("/api/dataspecs")).json();
+  specs = d.dataspecs || [];
+  if (d.error || !specs.length) throw new Error(d.error || "データ種別を読み込めません。隣に jvdata-store があるか確認してください。");
+  for (const s of specs) specOn.add(s.id);
+  $("#specbar").innerHTML = specs.map(s =>
+    `<label><input type="checkbox" data-spec="${s.id}" checked> <b>${s.id}</b> ${s.title}</label>`
+  ).join("") + `<div class="hint">この12種別で蓄積系の32表を覆います。
+    外すとその表は取得されません。</div>`;
+  for (const box of $("#specbar").querySelectorAll("input[data-spec]"))
+    box.onchange = () => box.checked ? specOn.add(box.dataset.spec)
+                                     : specOn.delete(box.dataset.spec);
+}
+
+async function loadTables(){
+  if (taskRunning) return;
+  const p = new URLSearchParams();
+  if ($("#hfrom").value) p.set("from", $("#hfrom").value);
+  if ($("#hto").value) p.set("to", $("#hto").value);
+  const d = await (await fetch("/api/history/tables?" + p)).json();
+  const el = $("#tablist");
+  if (d.error) { $("#data-message").textContent = d.error; return; }
+  $("#data-message").textContent = `保存先：${d.db}`;
+  if (!d.ready){
+    el.innerHTML = `<div class="tbl empty">未取得</div>`;
+    $("#griddetail").innerHTML = `<div class="card"><h2>取得済みデータ</h2><p>まだデータがありません。上の欄で年数を選び、「取得する」を押してください。</p></div>`;
+    return;
+  }
+  tables = d.tables;
+  $("#summary").textContent = `${tables.filter(t => t.rows).length} 表にデータあり`;
+  el.innerHTML = "";
+  for (const t of tables){
+    const div = document.createElement("div");
+    div.className = "tbl" + (t.rows ? "" : " empty") + (t.name === curTable ? " sel" : "");
+    div.onclick = () => { if (t.rows){ curTable = t.name; gridState = {offset:0, colOffset:0};
+                                       loadTables(); loadGrid(); } };
+    const span = t.date_from ? `${t.date_from} 〜 ${t.date_to}` : "日付なし";
+    const count = t.rows_in_range == null
+      ? `${t.rows.toLocaleString()} 行`
+      : `<b>期間内 ${t.rows_in_range.toLocaleString()} 行</b> / 全 ${t.rows.toLocaleString()} 行`;
+    div.innerHTML = `<div><span class="id">${t.record_id}</span>${t.title}</div>
+      <div class="sub">${count} ・ ${t.columns.toLocaleString()} 列</div>
+      <div class="sub">${t.rows ? span : "未取得"}</div>`;
+    el.appendChild(div);
+  }
+}
+
+async function loadGrid(){
+  if (taskRunning) return;
+  if (!curTable) return;
+  const p = new URLSearchParams({
+    name: curTable, limit: "50",
+    offset: String(gridState.offset), column_offset: String(gridState.colOffset),
+  });
+  if ($("#hfrom").value) p.set("from", $("#hfrom").value);
+  if ($("#hto").value) p.set("to", $("#hto").value);
+  const d = await (await fetch("/api/history/rows?" + p)).json();
+  if (d.error){ $("#griddetail").innerHTML = `<pre>${d.error}</pre>`; return; }
+  renderGrid(d);
+}
+
+function renderGrid(d){
+  const shownTo = d.column_offset + d.columns.length;
+  const rowTo = Math.min(d.offset + d.rows.length, d.total);
+  const filtered = ($("#hfrom").value || $("#hto").value) && d.filterable_by_date;
+  $("#griddetail").innerHTML = `
+    <div class="card">
+      <h2><span class="id">${d.record_id}</span> ${d.title}</h2>
+      <div class="kv muted">
+        <span>${d.total.toLocaleString()} 行${filtered ? "（ヘッダーの期間で絞り込み中）" : ""}</span>
+        <span>${d.column_total.toLocaleString()} 列</span>
+      </div>
+      ${d.filterable_by_date ? "" :
+        `<div class="hint">この表は開催日を持たないため、期間で絞れません。</div>`}
+    </div>
+    <div class="pager">
+      <button id="rprev" ${d.offset <= 0 ? "disabled" : ""}>← 前の50行</button>
+      <span>行 ${(d.offset + 1).toLocaleString()}–${rowTo.toLocaleString()} / ${d.total.toLocaleString()}</span>
+      <button id="rnext" ${rowTo >= d.total ? "disabled" : ""}>次の50行 →</button>
+      <span class="grow"></span>
+      <button id="cprev" ${d.column_offset <= 0 ? "disabled" : ""}>← 前の列</button>
+      <span>列 ${(d.column_offset + 1).toLocaleString()}–${shownTo.toLocaleString()} / ${d.column_total.toLocaleString()}</span>
+      <button id="cnext" ${shownTo >= d.column_total ? "disabled" : ""}>次の列 →</button>
+    </div>
+    <div class="gridwrap">
+      <table>
+        <thead><tr><th>#</th>${d.columns.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead>
+        <tbody>${d.rows.map((row, i) => `<tr><td>${(d.offset + i + 1).toLocaleString()}</td>${
+          row.map(v => `<td>${esc(v)}</td>`).join("")}</tr>`).join("")}</tbody>
+      </table>
+    </div>
+    ${d.column_total > d.columns.length
+      ? `<p class="hint">列が多い表は 60 列ずつ表示します。「次の列 →」で送れます。</p>` : ""}`;
+
+  const move = (k, v) => { gridState[k] = Math.max(0, gridState[k] + v); loadGrid(); };
+  $("#rprev").onclick = () => move("offset", -50);
+  $("#rnext").onclick = () => move("offset", 50);
+  $("#cprev").onclick = () => move("colOffset", -60);
+  $("#cnext").onclick = () => move("colOffset", 60);
+}
+
+function esc(v){
+  if (v === null || v === undefined) return `<span class="muted">null</span>`;
+  return String(v).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+}
+
+$("#hreload").onclick = () => { loadTables(); loadGrid(); };
+// 日付は取得の範囲ではなく、一覧と中身の**絞り込み**にだけ効く。
+// 取得する範囲は年数で決まる（取得は開催日ではなく提供時刻で切られるため）。
+for (const id of ["#hfrom", "#hto"])
+  $(id).onchange = () => { gridState.offset = 0; loadTables(); loadGrid(); };
+
+$("#hspecs").onclick = async () => {
+  try {
+    await loadSpecs();
+    $("#specbar").hidden = !$("#specbar").hidden;
+  } catch (error) { $("#data-message").textContent = error.message; }
+};
+
+$("#hfetch").onclick = async () => {
+  try { await loadSpecs(); }
+  catch (error) { $("#data-message").textContent = error.message; return; }
+  const years = Number($("#hyears").value);
+  if (!(Number.isInteger(years) && years >= 1 && years <= 40)) { alert("年数は1〜40の整数で指定してください。"); return; }
+  if (!specOn.size) { alert("データ種別を1つ以上選んでください。"); return; }
+  const all = specOn.size === specs.length;
+  const q = new URLSearchParams({years: String(years), force_setup: $("#hforce").checked ? "1" : "0"});
+  if (!all) q.set("dataspec", [...specOn].join(","));
+  runTask(`/api/history/fetch?${q}`);
+};
+
+$("#hsetup").onclick = () => {
+  alert("JV-Link の設定ダイアログは、このサーバを動かしている PC の画面に出ます。"
+      + "\nブラウザ側には何も出ません。");
+  runTask("/api/jvlink-setup");
+};
+
+async function initialize(){
+  setBusy(true);
+  try {
+    const info = await (await fetch("/api/info")).json();
+    $("#data-message").textContent = `保存先：${info.db}`;
+  } catch (error) { $("#data-message").textContent = error.message; }
+  await pollTask();
+}
+initialize();
+</script></body></html>

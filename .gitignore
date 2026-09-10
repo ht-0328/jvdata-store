@@ -10,6 +10,10 @@ state.json
 .uv-cache/
 test-artifacts/
 *.duckdb
+*.duckdb.wal
 
 # ドキュメントのビルド成果物
 site/
+
+# ローカル画面間のデータベース排他
+*.ui.lock
