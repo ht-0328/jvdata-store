@@ -377,8 +377,8 @@ def _expand(pattern: str) -> Iterable[Path]:
 def cmd_sync(args: argparse.Namespace) -> int:
     """過去N年ぶんの蓄積系データを、種別を順に回してまとめて DuckDB へ入れる。
 
-    取得の本体は :mod:`jvstore.sync` にある。keiba-yosou の Web 画面も
-    このコマンドを呼ぶので、コマンドラインと画面で挙動がずれない。
+    取得の本体は :mod:`jvstore.sync` にある。
+    jvstore の Web 画面もこのコマンドを呼ぶので、挙動がずれない。
     """
     from .sync import SYNC_DATASPECS, sync
 
@@ -562,6 +562,12 @@ def _add_setup_parser(subparsers: argparse._SubParsersAction) -> None:
     setup.set_defaults(func=cmd_setup)
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    from .web.server import serve
+    serve(Path(args.db), args.port, args.open)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="jvstore",
@@ -576,6 +582,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_parse_parser(subparsers)
     _add_sync_parser(subparsers)
     _add_setup_parser(subparsers)
+    screen = subparsers.add_parser("serve", help="データ取得・管理画面を開く")
+    screen.add_argument("--db", type=Path, default=Path("jvdata.duckdb"))
+    screen.add_argument("--port", type=int, default=8766)
+    screen.add_argument("--open", action="store_true", help="ブラウザを開く")
+    screen.set_defaults(func=cmd_serve)
     return parser
 
 

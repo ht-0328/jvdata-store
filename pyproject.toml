@@ -24,7 +24,7 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "jvstore"
-source-include = ["src/jvstore/resources/*.json"]
+source-include = ["src/jvstore/resources/*.json", "src/jvstore/web/static/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
