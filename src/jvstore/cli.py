@@ -3,6 +3,7 @@
     jvstore sync --years 10            過去N年ぶんの蓄積系データをまとめて取得する
     jvstore fetch --dataspec RACE ...  蓄積系データ(JVOpen)を期間を指定して取得する
     jvstore rt --dataspec 0B15 ...     速報系データ(JVRTOpen)を取得する
+    jvstore realtime --date 2026-09-20 開催日の速報（オッズ・馬体重・天候馬場・マイニング予想 …）をまとめて取得する
     jvstore parse raw/ ...             保存済みの生データを読み込む（JV-Link 不要）
     jvstore spec build --xlsx ...      JV-Data仕様書 xlsx からレイアウト定義を生成
     jvstore spec list                  取り込める表（レコード種別）とデータ種別IDの一覧
@@ -338,7 +339,9 @@ def cmd_rt(args: argparse.Namespace) -> int:
     link = _open_link(args)
     try:
         _log(f"JVRTOpen dataspec={args.dataspec} key={args.key}")
-        link.rt_open(args.dataspec, args.key)
+        if not link.rt_open(args.dataspec, args.key):
+            _log("該当データがありません（まだ発表されていないか、提供期間の1週間を過ぎています）")
+            return 0
         _consume(_link_records(link), args, layouts, _raw_dir_of(args))
         return 0
     except JVLinkError as error:
@@ -405,6 +408,30 @@ def cmd_sync(args: argparse.Namespace) -> int:
         _log(f"  {table:<28} {count:>12,}")
     if result.failed:
         _log(f"取得できなかったデータ種別: {', '.join(result.failed)}")
+        return 1
+    return 0
+
+
+def cmd_realtime(args: argparse.Namespace) -> int:
+    """開催日の速報系データを、種別を順に回してまとめて DuckDB へ入れる。
+
+    取得の本体は :mod:`jvstore.realtime` にある。jvstore の Web 画面もこのコマンドを呼ぶ。
+    """
+    from datetime import date
+
+    from .realtime import fetch_day, parse_day
+
+    days = [parse_day(day) for day in (args.date or [date.today().isoformat()])]
+    failed: list[str] = []
+    for position, day in enumerate(days):
+        if position:
+            _log("")
+        result = fetch_day(
+            Path(args.db), day, log=_log, layouts=_load_layouts(args), link_factory=lambda: _open_link(args),
+        )
+        failed += [f"{day} {dataspec}" for dataspec in result.failed]
+    if failed:
+        _log(f"取得できなかったデータ種別: {', '.join(failed)}")
         return 1
     return 0
 
@@ -555,6 +582,19 @@ def _add_sync_parser(subparsers: argparse._SubParsersAction) -> None:
     sync.set_defaults(func=cmd_sync)
 
 
+def _add_realtime_parser(subparsers: argparse._SubParsersAction) -> None:
+    realtime = subparsers.add_parser(
+        "realtime", help="開催日の速報（オッズ・馬体重・天候馬場・マイニング予想・出馬表の変更）をまとめて DuckDB に入れる"
+    )
+    realtime.add_argument(
+        "--date", action="append",
+        help="開催日 YYYY-MM-DD（何度でも書ける。省略すると今日）。速報の提供期間は1週間",
+    )
+    _add_jvlink_args(realtime)
+    _add_output_args(realtime)
+    realtime.set_defaults(func=cmd_realtime)
+
+
 def _add_setup_parser(subparsers: argparse._SubParsersAction) -> None:
     setup = subparsers.add_parser("setup", help="JV-Link の設定ダイアログを開く")
     setup.add_argument("--sid", default="UNKNOWN")
@@ -609,6 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_rt_parser(subparsers)
     _add_parse_parser(subparsers)
     _add_sync_parser(subparsers)
+    _add_realtime_parser(subparsers)
     _add_setup_parser(subparsers)
     _add_screen_parsers(subparsers)
     return parser

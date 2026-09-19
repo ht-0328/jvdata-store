@@ -170,6 +170,19 @@
   <p class="hint">初回や再取得は数十分〜数時間、保存容量は数GBになることがあります。取得中はデータの閲覧・予想を待機します。<br>
     利用キーが未登録なら「JV-Link設定」で登録してください。設定画面はこのPCに開きます。</p>
 </section>
+<section id="realtime" class="card">
+  <h2>速報の取得（発走前のオッズ・馬体重・天候と馬場状態・マイニング予想）</h2>
+  <p class="hint">上の「取得する」で入るのは、確定したあとのデータだけです。発走前に要るオッズ・人気・馬体重・天候と馬場状態・マイニング予想・<!--
+    -->取消や騎手変更は、開催日を指定してここで取得します。何度取り直しても構いません（新しい内容に置き換わり、オッズは発表時刻ごとに残ります）。</p>
+  <div class="fetch-controls">
+    <label>開催日 <input id="rtdate" type="date"></label>
+    <button id="rtfetch">速報を取得する</button>
+    <button id="rttoday" type="button">今日</button>
+    <button id="rttomorrow" type="button">明日</button>
+  </div>
+  <p class="hint">オッズは発売が始まってから（前日発売があれば前日の夜から）、馬体重は発走の約1時間前から、マイニング予想は出馬表の発表後から入ります。<!--
+    -->まだ発表されていないものは「該当データなし」と出ます。速報の提供期間は1週間です。1日ぶんで1分ほどかかります。</p>
+</section>
 <div id="taskbar" hidden><div id="task-status" role="status"></div><pre id="log"></pre></div>
 
 <div class="fetch-controls" style="padding:12px 18px">
@@ -184,7 +197,7 @@
 <script>
 const $ = s => document.querySelector(s);
 let taskRunning = false, polling = null;
-const BUSY_BUTTONS = ["#hfetch", "#hreload", "#hsetup"];
+const BUSY_BUTTONS = ["#hfetch", "#hreload", "#hsetup", "#rtfetch"];
 
 function setBusy(running){
   taskRunning = running;
@@ -398,6 +411,21 @@ $("#hfetch").onclick = async () => {
   const q = new URLSearchParams({years: String(years), force_setup: $("#hforce").checked ? "1" : "0"});
   if (!all) q.set("dataspec", [...specOn].join(","));
   runTask(`/api/history/fetch?${q}`);
+};
+
+// 速報の取得。開催日は、今日か明日を押すか、日付を選ぶ。
+function isoDay(offset){
+  const d = new Date();
+  d.setDate(d.getDate() + offset);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+$("#rtdate").value = isoDay(0);
+$("#rttoday").onclick = () => { $("#rtdate").value = isoDay(0); };
+$("#rttomorrow").onclick = () => { $("#rtdate").value = isoDay(1); };
+$("#rtfetch").onclick = () => {
+  const day = $("#rtdate").value;
+  if (!day) { alert("開催日を選んでください。"); return; }
+  runTask(`/api/realtime/fetch?${new URLSearchParams({date: day})}`);
 };
 
 $("#hsetup").onclick = () => {

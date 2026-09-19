@@ -13,6 +13,7 @@ from urllib.request import urlopen
 
 import duckdb
 
+from ..realtime import parse_day
 from ..sync import SYNC_DATASPECS
 from .db_lock import DatabaseLock
 from .shutdown import Shutdown
@@ -21,6 +22,9 @@ from .tasks import Task
 
 STATIC = Path(__file__).parent / "static"
 DEFAULT_PORT = 8766
+
+#: 1回の速報の取得で指定できる開催日の数。速報の提供期間が1週間なので、それより多くは要らない。
+MAX_REALTIME_DAYS = 7
 
 #: 停止の指示。`now` は処理中なら断り、`after_task` は処理が終わってから止める。
 SHUTDOWN_MODES = ("now", "after_task", "cancel")
@@ -52,6 +56,15 @@ class Backend:
         if force_setup:
             args += ["--force-setup"]
             label += "（期間を広げて再取得）"
+        return self.task.start(label, [[sys.executable, "-m", "jvstore.cli", *args]],
+                               Path.cwd(), db_lock=self._lock)
+
+    def fetch_realtime(self, days: list[str]):
+        """開催日の速報（オッズ・馬体重・天候馬場・マイニング予想 …）を取得する。``days`` は ``YYYYMMDD`` の並び。"""
+        args = ["realtime", "--db", str(self.db)]
+        for day in days:
+            args += ["--date", day]
+        label = "速報の取得（" + "、".join(f"{day[:4]}-{day[4:6]}-{day[6:]}" for day in days) + "）"
         return self.task.start(label, [[sys.executable, "-m", "jvstore.cli", *args]],
                                Path.cwd(), db_lock=self._lock)
 
@@ -150,6 +163,11 @@ def make_handler(backend: Backend):
                     return self._shutdown(_one(query, "when", "now"))
                 if url.path == "/api/jvlink-setup":
                     return self._json({"started": backend.jvlink_setup()})
+                if url.path == "/api/realtime/fetch":
+                    days = [parse_day(day) for day in query.get("date", [])]
+                    if not 1 <= len(days) <= MAX_REALTIME_DAYS:
+                        raise ValueError(f"開催日を1〜{MAX_REALTIME_DAYS}日で指定してください。")
+                    return self._json({"started": backend.fetch_realtime(days)})
                 if url.path != "/api/history/fetch":
                     return self._json({"error": "not found"}, 404)
                 years = int(_one(query, "years", "10"))

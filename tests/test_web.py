@@ -54,10 +54,10 @@ def api(tmp_path, monkeypatch):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    def post(query):
+    def post(query, path="/api/history/fetch"):
         con = HTTPConnection(*server.server_address, timeout=5)
         try:
-            con.request("POST", "/api/history/fetch?" + query)
+            con.request("POST", path + "?" + query)
             response = con.getresponse()
             return response.status, json.loads(response.read())
         finally:
@@ -90,6 +90,26 @@ def test_fetch_writes_to_browsed_database_and_forwards_mode(api, force):
 def test_invalid_request_never_starts_acquisition(api, query):
     _, calls, post = api
     status, result = post(query)
+    assert status == 400 and result["error"]
+    assert calls == []
+
+
+def test_realtime_fetch_runs_the_realtime_command_for_the_given_days(api):
+    backend, calls, post = api
+    status, result = post("date=2026-09-20&date=20260921", "/api/realtime/fetch")
+    assert status == 200 and result == {"started": True}
+    (label, steps, cwd), kwargs = calls[0]
+    command = steps[0]
+    assert command[:4] == [sys.executable, "-m", "jvstore.cli", "realtime"]
+    assert command[command.index("--db") + 1] == str(backend.db.resolve())
+    assert [command[i + 1] for i, word in enumerate(command) if word == "--date"] == ["20260920", "20260921"]
+    assert "2026-09-20" in label and kwargs["db_lock"] is backend._lock
+
+
+@pytest.mark.parametrize("query", ["", "date=2026-13-40", "date=abc", "&".join(f"date=2026-09-{d:02d}" for d in range(1, 9))])
+def test_invalid_realtime_request_never_starts_acquisition(api, query):
+    _, calls, post = api
+    status, result = post(query, "/api/realtime/fetch")
     assert status == 400 and result["error"]
     assert calls == []
 
