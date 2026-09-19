@@ -193,15 +193,20 @@ class JVLink:
             last_file_timestamp=str(returned[3] or ""),
         )
 
-    def rt_open(self, dataspec: str, key: str) -> None:
-        """速報系データの取得要求（JVRTOpen）。dataspec は 4 桁固定、key は提供単位に応じて指定。"""
+    def rt_open(self, dataspec: str, key: str) -> bool:
+        """速報系データの取得要求（JVRTOpen）。dataspec は 4 桁固定、key は提供単位に応じて指定。
+
+        読めるデータがあれば True。該当データが無い（まだ発表されていない・提供期間を過ぎた）なら False で、
+        そのときは ``records()`` を呼ばない（呼ぶと JVGets が -203 を返す）。
+        """
         code = int(self._com.JVRTOpen(dataspec, key))
         if code == _OPEN_NO_DATA:
             self._opened = True
-            return
+            return False
         if code != 0:
             raise JVLinkError("JVRTOpen", code)
         self._opened = True
+        return True
 
     def status(self) -> int:
         """ダウンロード済みファイル数（JVStatus）。"""
