@@ -104,7 +104,9 @@ class JVLink:
     """JV-Link COM オブジェクトのラッパ。``with`` で使うと確実に JVClose される。"""
 
     PROGID = "JVDTLab.JVLink"
-    BUFFER_SIZE = 200_000  # 最長レコード(H6: 102,890バイト)より十分大きく取る
+    #: JVGets に伝えるバッファの大きさ。最長レコード(H6: 102,890バイト)より大きくする。
+    #: 実際のバッファは JV-Link が確保するので、この大きさのバッファは作らない（``gets``）。
+    BUFFER_SIZE = 200_000
 
     def __init__(self, sid: str = "UNKNOWN") -> None:
         import pythoncom  # noqa: F401  （COM を使うスレッドで初期化しておく）
@@ -224,13 +226,15 @@ class JVLink:
 
         コードは >0:読み込んだバイト数 / 0:EOF / -1:ファイル切り替わり / -3:ダウンロード中。
         """
-        buffer = bytearray(self.BUFFER_SIZE)
+        # バッファは空で渡す。JV-Link は渡されたバッファを解放せず、自分で確保した
+        # バイト配列に差し替えて返す（インターフェース仕様書 p.28「JVGets について」）。
+        # 以前は 200KB のバッファを渡していて、1回ごとにその分が解放されずに残り、
+        # 36万レコードの取り込みでメモリが 79GB になった。
         returned, memory, filename = self._com.JVGets(
-            buffer, self.BUFFER_SIZE, bytearray()
+            bytearray(), self.BUFFER_SIZE, bytearray()
         )
         code = int(returned)
-        # 戻り値はバッファにセットされたデータのサイズ。バッファ全体が返るので
-        # 必ず code バイトで切り詰める（残りは未初期化の 0x00 が並ぶ）。
+        # 戻り値はバッファにセットされたデータのサイズ。必ず code バイトで切り詰める。
         data = memory.tobytes()[:code] if code > 0 and memory is not None else b""
         return code, data, str(filename or "")
 
