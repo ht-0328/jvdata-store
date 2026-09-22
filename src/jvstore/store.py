@@ -51,6 +51,9 @@ SEQ_COLUMN = "_連番"
 #: 同じ規則にそろえる。
 _DUPLICATE_SUFFIX = "#2"
 
+#: 主キーを外すために子テーブルを作り直すとき、一時的に付ける名前の接尾辞。
+_REBUILD_SUFFIX = "#作り直し"
+
 #: ``データ区分`` を新旧比較できる1文字へ写す。
 #:
 #: 削除(0)と中止(9)を最大にしているのは、あとから古いファイルを読み直しても
@@ -240,6 +243,10 @@ class DuckStore:
     **より新しい版だけが残る**。新旧は ``データ作成年月日`` と ``データ区分`` で比べる。
     削除レコード（データ区分=0）は行を消さずに残し、古いファイルを読み直しても
     削除が取り消されないようにする。
+
+    **主キーを付けるのは親テーブルだけにする。** 子テーブルの重複は、親が置き換わったときに
+    子を丸ごと入れ替えることで防ぐ（``_merge_child``）。3連単の票数・オッズの子テーブルは
+    10年分で1億行を超え、主キーがあると取り込むほど書き込みが遅くなるため。
     """
 
     def __init__(
@@ -284,10 +291,39 @@ class DuckStore:
             return
         self._create_table(spec.table, spec.columns, spec.keys)
         for child in spec.children:
-            child_keys = spec.keys + [SEQ_COLUMN] if spec.keys else []
-            self._create_table(child.table, spec.child_columns(child), child_keys)
+            self._create_table(child.table, spec.child_columns(child), [])
+            self._drop_primary_key(child.table)
         self._record_table_metadata(spec)
         self._ready.add(spec.record_id)
+
+    def _drop_primary_key(self, table: str) -> None:
+        """以前の版が子テーブルに付けていた主キーを外す。
+
+        以前の版は子テーブルにも主キー（親のキー＋``_連番``）を付けていた。
+        3連単の票数・オッズが7千万行に近づいたところで、5万レコードの取り込みに
+        70分かかるまで遅くなり、メモリも35GBまで増えた。
+
+        DuckDB は主キーをあとから外せない（``ALTER TABLE … DROP CONSTRAINT`` が無い）ので、
+        同じ中身の表を作り直す。主キーが無ければ何もしない。
+        """
+        found = self.con.execute(
+            "SELECT count(*) FROM duckdb_constraints() "
+            "WHERE table_name = ? AND constraint_type = 'PRIMARY KEY'",
+            [table],
+        ).fetchone()[0]
+        if not found:
+            return
+        quoted = _quoted(table)
+        rebuilt = _quoted(f"{table}{_REBUILD_SUFFIX}")
+        self.con.execute("BEGIN")
+        try:
+            self.con.execute(f"CREATE TABLE {rebuilt} AS SELECT * FROM {quoted}")
+            self.con.execute(f"DROP TABLE {quoted}")
+            self.con.execute(f"ALTER TABLE {rebuilt} RENAME TO {quoted}")
+            self.con.execute("COMMIT")
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
 
     def _create_table(
         self, table: str, columns: Sequence[str], keys: Sequence[str]

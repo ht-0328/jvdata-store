@@ -78,6 +78,45 @@ def test_すべての表でスキーマを作れる(tmp_path):
 def test_オッズ表は発表時刻が主キーに入る():
     # 時系列オッズを貯めるには、レースキーだけでは断面が1つしか残らない
     assert "発表月日時分" in build_spec(LAYOUTS.get("O1")).keys
+
+
+def primary_keys(s: DuckStore, table: str) -> list[list[str]]:
+    return [row[0] for row in s.con.execute(
+        "SELECT constraint_column_names FROM duckdb_constraints() "
+        "WHERE table_name = ? AND constraint_type = 'PRIMARY KEY'",
+        [table],
+    ).fetchall()]
+
+
+def test_主キーは親テーブルだけに付く(tmp_path):
+    """子テーブルに主キーがあると、1億行を超える3連単で取り込むほど遅くなる。"""
+    with store(tmp_path) as s:
+        s._ensure_table(build_spec(LAYOUTS.get("H6")))
+        assert primary_keys(s, "h6") == [build_spec(LAYOUTS.get("H6")).keys]
+        assert primary_keys(s, "h6__3連単票数") == []
+
+
+def test_以前の版の子テーブルは主キーを外して中身を残す(tmp_path):
+    spec = build_spec(LAYOUTS.get("O5"))
+    columns = spec.child_columns(spec.children[0])
+    definitions = ", ".join(
+        f'"{c}" {"INTEGER" if c == SEQ_COLUMN else "VARCHAR"}' for c in columns
+    )
+    keys = ", ".join(f'"{k}"' for k in spec.keys + [SEQ_COLUMN])
+    old_row = [RACE.get(c, "09061500") for c in spec.keys] + [0, "010203", "001234", "001"]
+    with store(tmp_path) as s:
+        s.con.execute(
+            f'CREATE TABLE "o5__3連複オッズ" ({definitions}, PRIMARY KEY ({keys}))'
+        )
+        s.con.execute(
+            f'INSERT INTO "o5__3連複オッズ" VALUES ({", ".join("?" * len(columns))})',
+            old_row,
+        )
+    with store(tmp_path) as s:
+        s._ensure_table(spec)
+        assert primary_keys(s, "o5__3連複オッズ") == []
+        rows = s.con.execute('SELECT * FROM "o5__3連複オッズ"').fetchall()
+    assert rows == [tuple(old_row)]
     assert "発表月日時分" not in build_spec(LAYOUTS.get("RA")).keys
 
 
@@ -133,6 +172,29 @@ def test_同じレコードを2回入れても増えない(tmp_path):
         s.write(rec)
         s.flush()
         assert s.con.execute("SELECT count(*) FROM ra").fetchone()[0] == 1
+
+
+def test_同じレコードを2回入れても子の行は増えない(tmp_path):
+    """子テーブルには主キーが無いので、重複は親の置き換えで防いでいることを確かめる。"""
+    rec = make_record(
+        "O5",
+        {**RACE, "発表月日時分": "09061530", "データ作成年月日": "20260906"},
+        repeats={"o5__3連複オッズ": [
+            {"組番": "010203", "オッズ": "001234", "人気順": "001"},
+            {"組番": "010204", "オッズ": "005678", "人気順": "002"},
+        ]},
+    )
+    with store(tmp_path) as s:
+        s.write(rec)
+        s.write(rec)
+        s.flush()
+        s.write(rec)
+        s.flush()
+    with store(tmp_path) as s:
+        s.write(rec)
+        s.flush()
+        count = s.con.execute('SELECT count(*) FROM "o5__3連複オッズ"').fetchone()[0]
+    assert count == 2
 
 
 def test_新しい版が古い版を上書きする(tmp_path):
