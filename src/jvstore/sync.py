@@ -6,6 +6,11 @@
 
 データ種別ごとに、初回はセットアップ（option=4）、2回目以降は前回の続き（option=1）。
 どこまで取ったかは DuckDB の ``_meta`` に持つので、状態ファイルは要らない。
+
+**セットアップは1年ずつに区切って開く。** JV-Link は、一度に開くファイルが多いほど
+1レコードの読み出しが遅くなる（JV-Linkインターフェース仕様書 4.9.0.1 p.17「既知の障害」）。
+15年分のレース情報を一度に開くと約2,800ファイルになり、1か月分の読み出しに12分かかった。
+1年分なら約170ファイルで済む。
 """
 
 from __future__ import annotations
@@ -21,9 +26,12 @@ from .layout import LayoutSet, load_layouts
 from .store import DuckStore
 
 if TYPE_CHECKING:  # JV-Link は Windows + COM が必要なので実行時には読み込まない
-    from .jvlink import JVLink, OpenResult
+    from .jvlink import BrokenFileError, JVLink, OpenResult
 
-__all__ = ["SYNC_DATASPECS", "Cancelled", "SyncResult", "check_cancel", "sync"]
+__all__ = [
+    "RANGED_DATASPECS", "SYNC_DATASPECS", "Cancelled", "SyncResult",
+    "check_cancel", "open_times", "sync",
+]
 
 #: 過去N年ぶんを取るときに回すデータ種別。この12個で蓄積系の32表を過不足なく覆う。
 #:
@@ -48,6 +56,11 @@ SYNC_DATASPECS: tuple[tuple[str, str], ...] = (
 
 TITLES = dict(SYNC_DATASPECS)
 
+#: 読み出しの終わりの時刻を指定できる種別。セットアップを1年ずつに区切って開く。
+#: ほかの種別（DIFN HOSN HOYU COMM TOKU）は終わりを指定すると「該当データなし」になる
+#: （JV-Linkインターフェース仕様書 4.9.0.1 p.18）ので、これまでどおり一度に開く。
+RANGED_DATASPECS = frozenset({"RACE", "SNPN", "MING", "BLDN", "WOOD", "YSCH", "SLOP"})
+
 #: ``_meta`` に前回の続きの時刻を残すときのキーの接頭辞。
 _META_PREFIX = "sync:"
 
@@ -61,6 +74,10 @@ _FIRST_YEAR = 1986
 #: 過去年数として受け付ける範囲（両端を含む）。
 _MIN_YEARS = 1
 _MAX_YEARS = 40
+
+#: 壊れたファイルを消して開き直す回数の上限（1回の読み出し範囲ごと）。
+#: 消しても同じエラーが続くときに、同じ範囲を延々と読み直さないため。
+_MAX_REOPEN = 3
 
 #: 途中経過を出すレコード件数の刻み。
 _PROGRESS_EVERY = 50000
@@ -95,6 +112,27 @@ def start_time(years: int, today: date | None = None) -> str:
         raise ValueError(f"過去年数は{_MIN_YEARS}〜{_MAX_YEARS}年で指定してください。")
     year = (today or date.today()).year - years
     return f"{max(_FIRST_YEAR, year):04d}0101000000"
+
+
+def open_times(
+    dataspec: str, fromtime: str, option: int, today: date | None = None
+) -> list[str]:
+    """1データ種別を取り込むときに ``JVOpen`` へ順に渡す読み出し時刻。
+
+    セットアップで、終わりを指定できる種別なら、開始の年から1年ずつに区切る。
+    区切りの終わりは翌年1月1日0時にする。ファイル名の ``年月99``（例: ``20111299…``）と
+    文字として比べられるので、12月31日にすると12月分が外れる。
+    **今年の分だけは終わりを指定しない。** 最新のファイルまで読み、その時刻を
+    次回の続きの起点にするため。
+    """
+    if option != _OPTION_SETUP or dataspec not in RANGED_DATASPECS:
+        return [fromtime]
+    this_year = (today or date.today()).year
+    past = [
+        f"{year:04d}0101000000-{year + 1:04d}0101000000"
+        for year in range(int(fromtime[:4]), this_year)
+    ]
+    return past + [f"{this_year:04d}0101000000"]
 
 
 def sync(
@@ -187,46 +225,130 @@ def _sync_dataspec(
     stop: Event | None,
     dry_run: bool,
 ) -> None:
-    """1データ種別ぶんを取り込む。失敗しても呼び手は次の種別へ進む。"""
+    """1データ種別ぶんを取り込む。失敗しても呼び手は次の種別へ進む。
+
+    1年ずつに区切ったときは、全部の年を読み終えてから続きの起点を残す。
+    途中の年で失敗したら残さないので、次回また最初の年から取り直す。
+    """
+    times = open_times(dataspec, fromtime, option)
+    latest = ""
+    for opentime in times:
+        check_cancel(stop)
+        if len(times) > 1:
+            log(f"  -- {opentime[:4]}年")
+        timestamp = _sync_range(
+            link, store, opentime, dataspec, option, summary, log=log, stop=stop, dry_run=dry_run
+        )
+        if timestamp is None:
+            summary.failed.append(dataspec)
+            return
+        latest = max(latest, timestamp)
+    if not dry_run:
+        _remember_progress(store, dataspec, latest)
+
+
+def _sync_range(
+    link: "JVLink",
+    store: DuckStore,
+    opentime: str,
+    dataspec: str,
+    option: int,
+    summary: SyncResult,
+    *,
+    log: Callable[[str], None],
+    stop: Event | None,
+    dry_run: bool,
+) -> str | None:
+    """1回の ``JVOpen`` で開けるぶんを読み切る。最新ファイルの時刻を返し、失敗なら None。
+
+    保存パスのファイルが壊れていたら、そのファイルを消して ``JVOpen`` からやり直す
+    （インターフェース仕様書 p.33「JVFiledelete」）。消したファイルは開き直すときに
+    ダウンロードし直される。読み終えたレコードをもう一度書いても行は増えない。
+    """
+    from .jvlink import BrokenFileError
+
+    for _ in range(_MAX_REOPEN):
+        try:
+            return _open_and_read(
+                link, store, opentime, dataspec, option, summary,
+                log=log, stop=stop, dry_run=dry_run,
+            )
+        except BrokenFileError as error:
+            log(f"  {error}")
+            if not _delete_broken(link, error, log=log):
+                return None
+            log("  壊れたファイルを消しました。開き直してダウンロードし直します")
+    log(f"  {_MAX_REOPEN}回開き直しても読めませんでした")
+    return None
+
+
+def _delete_broken(
+    link: "JVLink", error: "BrokenFileError", *, log: Callable[[str], None]
+) -> bool:
+    """壊れたファイルを消す。消すファイルが分からない・消せないなら False。"""
     from .jvlink import JVLinkError
 
+    names = [error.filename] if error.filename else link.empty_files()
+    if not names:
+        log("  壊れたファイルの名前が分からないので、消せませんでした")
+        return False
     try:
-        result = link.open(dataspec, fromtime, option)
+        for name in names:
+            log(f"  削除: {name}")
+            link.file_delete(name)
+    except JVLinkError as delete_error:
+        log(f"  削除できませんでした: {delete_error}")
+        return False
+    return True
+
+
+def _open_and_read(
+    link: "JVLink",
+    store: DuckStore,
+    opentime: str,
+    dataspec: str,
+    option: int,
+    summary: SyncResult,
+    *,
+    log: Callable[[str], None],
+    stop: Event | None,
+    dry_run: bool,
+) -> str | None:
+    """``JVOpen`` して読み切る。壊れたファイルに当たったら BrokenFileError を投げる。"""
+    from .jvlink import BrokenFileError, JVLinkError
+
+    try:
+        result = link.open(dataspec, opentime, option)
     except JVLinkError as error:
         log(f"  取得できませんでした: {error}")
-        summary.failed.append(dataspec)
-        return
+        return None
     log(
         f"  対象ファイル {result.read_count:,} 件 / 要ダウンロード "
         f"{result.download_count:,} 件"
     )
-    if result.read_count == 0 or dry_run:
-        if not dry_run:
-            _remember_progress(store, dataspec, result)
-        link.close()
-        return
     try:
-        _read_records(link, store, dataspec, result, summary, log=log, stop=stop)
-    except Cancelled:
+        if result.read_count > 0 and not dry_run:
+            _read_records(link, store, result, summary, log=log, stop=stop)
+    except (Cancelled, BrokenFileError):
         raise
     except Exception as error:  # noqa: BLE001
         log(f"  読み込みに失敗しました: {error}")
-        summary.failed.append(dataspec)
+        return None
     finally:
         link.close()
+    return result.last_file_timestamp
 
 
 def _read_records(
     link: "JVLink",
     store: DuckStore,
-    dataspec: str,
     result: "OpenResult",
     summary: SyncResult,
     *,
     log: Callable[[str], None],
     stop: Event | None,
 ) -> None:
-    """1データ種別ぶんを読み切って書き込む。"""
+    """開いたぶんを読み切って書き込む。"""
     link.wait_download(
         result,
         on_progress=lambda done, total: log(f"  ダウンロード {done:,}/{total:,}"),
@@ -240,15 +362,14 @@ def _read_records(
         if written % _PROGRESS_EVERY == 0:
             log(f"  {written:,} レコード ({time.time() - started:.0f}秒)")
     store.flush()
-    # 読み切ってから記録する。途中で落ちたら次回もう一度同じ範囲を取る。
-    _remember_progress(store, dataspec, result)
     summary.records += written
     log(f"  {written:,} レコード / {time.time() - started:.1f} 秒")
 
 
-def _remember_progress(
-    store: DuckStore, dataspec: str, result: "OpenResult"
-) -> None:
-    """次回の続きの起点を残す。タイムスタンプが取れないときは触らない。"""
-    if result.last_file_timestamp:
-        store.set_meta(_META_PREFIX + dataspec, result.last_file_timestamp)
+def _remember_progress(store: DuckStore, dataspec: str, timestamp: str) -> None:
+    """次回の続きの起点を残す。タイムスタンプが取れないときは触らない。
+
+    読み切ってから呼ぶ。途中で落ちたら次回もう一度同じ範囲を取る。
+    """
+    if timestamp:
+        store.set_meta(_META_PREFIX + dataspec, timestamp)

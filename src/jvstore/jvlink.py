@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterator
 
 __all__ = [
+    "BrokenFileError",
     "JVLink",
     "JVLinkError",
     "OpenResult",
@@ -62,6 +64,10 @@ _GETS_EOF = 0
 _GETS_NEXT_FILE = -1
 _GETS_DOWNLOADING = -3
 
+#: JVGets の戻り値のうち、保存パスのファイルが壊れていることを表すもの。
+#: -402: ファイルサイズが0 / -403: データ内容が異常。
+_GETS_BROKEN_FILE = (-402, -403)
+
 #: JVOpen が「該当データ無し」を表す戻り値。エラーにはしない。
 _OPEN_NO_DATA = -1
 
@@ -77,6 +83,18 @@ class JVLinkError(RuntimeError):
         super().__init__(f"{func} エラー: {code} ({describe_error(code)})")
         self.func = func
         self.code = code
+
+
+class BrokenFileError(JVLinkError):
+    """保存パスのファイルが壊れていて読めない。
+
+    インターフェース仕様書 p.33「JVFiledelete」: ファイルを削除し、
+    直前の JVOpen からやり直す。``filename`` はそのファイル名（分からなければ空）。
+    """
+
+    def __init__(self, code: int, filename: str) -> None:
+        super().__init__("JVGets", code)
+        self.filename = filename
 
 
 @dataclass(slots=True)
@@ -164,6 +182,17 @@ class JVLink:
         code = int(self._com.JVFiledelete(filename))
         if code != 0:
             raise JVLinkError("JVFiledelete", code)
+
+    def empty_files(self) -> list[str]:
+        """保存パスにある、大きさ0のファイルの名前。
+
+        JVGets が -402（ファイルサイズ＝0）を返したのにファイル名を返さないとき、
+        消すべきファイルをここから探す。
+        """
+        root = Path(str(self._com.m_savepath or ""))
+        if not root.is_dir():
+            return []
+        return sorted(f.name for f in root.rglob("*.jvd") if f.stat().st_size == 0)
 
     def __enter__(self) -> "JVLink":
         self.init()
@@ -274,5 +303,7 @@ class JVLink:
                 time.sleep(retry_interval)
             elif code == _GETS_EOF:
                 return
+            elif code in _GETS_BROKEN_FILE:
+                raise BrokenFileError(code, filename)
             else:
                 raise JVLinkError("JVGets", code)
