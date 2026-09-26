@@ -83,14 +83,14 @@ def test_該当データなしは失敗にしない(tmp_path):
 def test_1つの種別が失敗しても残りを続ける(tmp_path):
     link = FakeLink({"0B15": [_race_record()]}, broken=("0B14",))
     result, log = _fetch(tmp_path, link)
-    assert result.failed == ["0B14"] and ("0B31", RACE_KEY) in link.calls
+    assert result.failed == ["0B14"] and ("0B30", RACE_KEY) in link.calls
     assert any("取得できませんでした" in line for line in log)
 
 
 def test_その日のレースが無ければ_オッズは取りにいかない(tmp_path):
     link = FakeLink()
     result, log = _fetch(tmp_path, link)
-    assert result.races == 0 and all(dataspec != "0B31" for dataspec, _ in link.calls)
+    assert result.races == 0 and all(dataspec != "0B30" for dataspec, _ in link.calls)
     assert any("その日のレースが DB にありません" in line for line in log)
 
 
@@ -99,7 +99,7 @@ def test_取ったレコードは_DuckDB_に入る(tmp_path):
 
     odds = make_record("O1", {**RACE, "発表月日時分": "09061000", "データ区分": "1", "データ作成年月日": DAY},
                        repeats={"o1__単勝オッズ": [{"馬番": "01", "オッズ": "0035", "人気順": "01"}]})
-    link = FakeLink({"0B15": [_race_record()], "0B31": [odds]})
+    link = FakeLink({"0B15": [_race_record()], "0B30": [odds]})
     _fetch(tmp_path, link)
     con = duckdb.connect(str(tmp_path / "db.duckdb"), read_only=True)
     try:
