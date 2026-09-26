@@ -26,7 +26,7 @@ from .layout import LayoutSet, load_layouts
 from .store import DuckStore
 
 if TYPE_CHECKING:  # JV-Link は Windows + COM が必要なので実行時には読み込まない
-    from .jvlink import JVLink, OpenResult
+    from .jvlink import BrokenFileError, JVLink, OpenResult
 
 __all__ = [
     "RANGED_DATASPECS", "SYNC_DATASPECS", "Cancelled", "SyncResult",
@@ -74,6 +74,10 @@ _FIRST_YEAR = 1986
 #: 過去年数として受け付ける範囲（両端を含む）。
 _MIN_YEARS = 1
 _MAX_YEARS = 40
+
+#: 壊れたファイルを消して開き直す回数の上限（1回の読み出し範囲ごと）。
+#: 消しても同じエラーが続くときに、同じ範囲を延々と読み直さないため。
+_MAX_REOPEN = 3
 
 #: 途中経過を出すレコード件数の刻み。
 _PROGRESS_EVERY = 50000
@@ -255,8 +259,63 @@ def _sync_range(
     stop: Event | None,
     dry_run: bool,
 ) -> str | None:
-    """1回の ``JVOpen`` で開けるぶんを読み切る。最新ファイルの時刻を返し、失敗なら None。"""
+    """1回の ``JVOpen`` で開けるぶんを読み切る。最新ファイルの時刻を返し、失敗なら None。
+
+    保存パスのファイルが壊れていたら、そのファイルを消して ``JVOpen`` からやり直す
+    （インターフェース仕様書 p.33「JVFiledelete」）。消したファイルは開き直すときに
+    ダウンロードし直される。読み終えたレコードをもう一度書いても行は増えない。
+    """
+    from .jvlink import BrokenFileError
+
+    for _ in range(_MAX_REOPEN):
+        try:
+            return _open_and_read(
+                link, store, opentime, dataspec, option, summary,
+                log=log, stop=stop, dry_run=dry_run,
+            )
+        except BrokenFileError as error:
+            log(f"  {error}")
+            if not _delete_broken(link, error, log=log):
+                return None
+            log("  壊れたファイルを消しました。開き直してダウンロードし直します")
+    log(f"  {_MAX_REOPEN}回開き直しても読めませんでした")
+    return None
+
+
+def _delete_broken(
+    link: "JVLink", error: "BrokenFileError", *, log: Callable[[str], None]
+) -> bool:
+    """壊れたファイルを消す。消すファイルが分からない・消せないなら False。"""
     from .jvlink import JVLinkError
+
+    names = [error.filename] if error.filename else link.empty_files()
+    if not names:
+        log("  壊れたファイルの名前が分からないので、消せませんでした")
+        return False
+    try:
+        for name in names:
+            log(f"  削除: {name}")
+            link.file_delete(name)
+    except JVLinkError as delete_error:
+        log(f"  削除できませんでした: {delete_error}")
+        return False
+    return True
+
+
+def _open_and_read(
+    link: "JVLink",
+    store: DuckStore,
+    opentime: str,
+    dataspec: str,
+    option: int,
+    summary: SyncResult,
+    *,
+    log: Callable[[str], None],
+    stop: Event | None,
+    dry_run: bool,
+) -> str | None:
+    """``JVOpen`` して読み切る。壊れたファイルに当たったら BrokenFileError を投げる。"""
+    from .jvlink import BrokenFileError, JVLinkError
 
     try:
         result = link.open(dataspec, opentime, option)
@@ -270,7 +329,7 @@ def _sync_range(
     try:
         if result.read_count > 0 and not dry_run:
             _read_records(link, store, result, summary, log=log, stop=stop)
-    except Cancelled:
+    except (Cancelled, BrokenFileError):
         raise
     except Exception as error:  # noqa: BLE001
         log(f"  読み込みに失敗しました: {error}")

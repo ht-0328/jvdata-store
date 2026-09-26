@@ -13,6 +13,7 @@ from threading import Event
 import pytest
 
 from jvstore import load_layouts
+from jvstore.jvlink import BrokenFileError
 from jvstore.store import DuckStore
 from jvstore.sync import SYNC_DATASPECS, Cancelled, open_times, start_time, sync
 
@@ -45,6 +46,7 @@ class FakeLink:
         self._read_count = read_count
         #: 開いた読み出し時刻ごとの最新ファイルの時刻。無ければ FakeResult の既定値。
         self._timestamps = timestamps or {}
+        self.deleted: list[str] = []
 
     def init(self):
         self.inited += 1
@@ -63,6 +65,12 @@ class FakeLink:
 
     def close(self):
         self.closed += 1
+
+    def file_delete(self, filename):
+        self.deleted.append(filename)
+
+    def empty_files(self):
+        return []
 
 
 def test_開始時刻は年の1月1日まで切り下げる():
@@ -275,3 +283,64 @@ def test_JV_Link_は必ず閉じる(tmp_path):
     sync(tmp_path / "db.duckdb", years=10, dataspecs=["RACE"], log=lambda s: None,
          layouts=LAYOUTS, link_factory=lambda: link)
     assert link.closed >= 1
+
+
+class BrokenOnce(FakeLink):
+    """最初に開いたときだけ、読み込みの途中で壊れたファイルに当たる JV-Link。"""
+
+    def __init__(self, records, filename="H1VM2015129920230808171428.jvd", times=1):
+        super().__init__(records)
+        self.filename = filename
+        self.times = times
+
+    def records(self, on_file=None):
+        yield from super().records(on_file)
+        if self.times > 0 and self.calls[-1][0] == "DIFN":
+            self.times -= 1
+            raise BrokenFileError(-402, self.filename)
+
+
+def test_壊れたファイルは消して開き直す(tmp_path):
+    """仕様書 p.33: JVFiledelete で消し、直前の JVOpen からやり直す。"""
+    db = tmp_path / "db.duckdb"
+    rec = make_record("RA", {**RACE, "データ作成年月日": "20260910"})
+    link = BrokenOnce([rec])
+    result = sync(db, years=1, dataspecs=["DIFN"], log=lambda s: None,
+                  layouts=LAYOUTS, link_factory=lambda: link)
+    assert link.deleted == ["H1VM2015129920230808171428.jvd"]
+    assert [c[0] for c in link.calls] == ["DIFN", "DIFN"], "消したあと同じ範囲を開き直す"
+    assert result.failed == []
+    assert result.counts["ra"] == 1, "読み直したレコードで行は増えない"
+    after = FakeLink(read_count=0)
+    sync(db, years=1, dataspecs=["DIFN"], log=lambda s: None,
+         layouts=LAYOUTS, link_factory=lambda: after)
+    assert after.calls[0][2] == 1, "開き直して読み切れたので、続きの起点が残る"
+
+
+def test_ファイル名が分からなければ大きさ0のファイルを消す(tmp_path):
+    class NoName(BrokenOnce):
+        def empty_files(self):
+            return ["H1VM2015129920230808171428.jvd"]
+
+    link = NoName([], filename="")
+    result = sync(tmp_path / "db.duckdb", years=1, dataspecs=["DIFN"], log=lambda s: None,
+                  layouts=LAYOUTS, link_factory=lambda: link)
+    assert link.deleted == ["H1VM2015129920230808171428.jvd"]
+    assert result.failed == []
+
+
+def test_消すファイルが分からなければ失敗にする(tmp_path):
+    link = BrokenOnce([], filename="")
+    result = sync(tmp_path / "db.duckdb", years=1, dataspecs=["DIFN"], log=lambda s: None,
+                  layouts=LAYOUTS, link_factory=lambda: link)
+    assert link.deleted == []
+    assert result.failed == ["DIFN"]
+
+
+def test_何度開き直しても壊れていれば諦めて次の種別へ進む(tmp_path):
+    link = BrokenOnce([], times=99)
+    result = sync(tmp_path / "db.duckdb", years=1, dataspecs=["DIFN", "HOSN"],
+                  log=lambda s: None, layouts=LAYOUTS, link_factory=lambda: link)
+    assert result.failed == ["DIFN"]
+    assert [c[0] for c in link.calls].count("DIFN") == 3, "同じ範囲を延々と読み直さない"
+    assert link.calls[-1][0] == "HOSN"
