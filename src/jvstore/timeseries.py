@@ -13,6 +13,10 @@ keiba-yosou が「買う時点のオッズでも同じ結果になるか」を�
 
 途中で止めても続きから取り直せる。取り込み先に締め切り前の断面（データ区分 1〜3）がすでにあるレースは、
 データ種別ごとに飛ばす。
+
+**書き込みは開催日ごとにまとめる。** :class:`~jvstore.store.DuckStore` は書き込むたびに、置き換わる親の子の行を
+子の表の全体から探して消す。1レースごとに書き込むと、表が大きくなるほど1回が遅くなり、1年ぶんでは終わらない
+（実測で、1開催日の取り込みが 20 日目で 57 秒から 100 秒に延びた）。開催日ごとにまとめれば、回数が数十分の1になる。
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ from typing import Any, Callable
 import duckdb
 
 from .layout import LayoutSet, load_layouts
-from .realtime import RealtimeResult, _fetch_one, _initialised_link, parse_day
+from .realtime import _initialised_link, parse_day
 from .store import DuckStore
 from .sync import check_cancel
 
@@ -37,6 +41,8 @@ TIMESERIES_DATASPECS: tuple[tuple[str, str, str], ...] = (
     ("0B41", "o1", "時系列オッズ（単複枠）"),
     ("0B42", "o2", "時系列オッズ（馬連）"),
 )
+#: 1開催日ぶんを溜めてから書き込むための、書き込みの単位（レコード数）。1開催日で数万レコードなので、これで溜まりきる。
+_DAY_BATCH = 10_000_000
 #: 締め切り前の断面のデータ区分（1 中間・2 前日売最終・3 最終）。
 _BEFORE_FINAL = ("1", "2", "3")
 _JRA_VENUES = ("01", "10")
@@ -84,7 +90,7 @@ def fetch_timeseries(
     log(f"{first}〜{last} の {len(races_by_day)} 開催日・{result.races:,} レースの時系列オッズを取得します")
     log(f"保存先: {Path(db_path).resolve()}")
 
-    store = DuckStore(db_path, layouts or load_layouts())
+    store = DuckStore(db_path, layouts or load_layouts(), batch=_DAY_BATCH)
     link = link_factory() if link_factory else _initialised_link(JVLink)
     try:
         done = {dataspec: set() if refetch else _fetched_races(store, table) for dataspec, table, _ in TIMESERIES_DATASPECS}
@@ -93,6 +99,7 @@ def fetch_timeseries(
             for race_key in races:
                 check_cancel(stop)
                 _fetch_race(link, store, race_key, done, result, log=log)
+            store.flush()
             written = ", ".join(f"{dataspec} {result.records.get(dataspec, 0):,}" for dataspec, _, _ in TIMESERIES_DATASPECS)
             log(f"{day[:4]}-{day[4:6]}-{day[6:]} {len(races)} レース / {time.time() - started:.0f} 秒（累計 {written} レコード）")
     finally:
@@ -113,18 +120,34 @@ def _fetch_race(
     *,
     log: Callable[[str], None],
 ) -> None:
-    """1レースぶん、取り込み済みでないデータ種別だけを取る。"""
+    """1レースぶん、取り込み済みでないデータ種別だけを取って、書き込み待ちに積む（書き込みは開催日ごと）。"""
     for dataspec, _, _ in TIMESERIES_DATASPECS:
         if race_key in done[dataspec]:
             result.skipped[dataspec] = result.skipped.get(dataspec, 0) + 1
             continue
-        summary = RealtimeResult()
-        _fetch_one(link, store, dataspec, race_key, summary, log=log, label="", quiet=True)
-        result.records[dataspec] = result.records.get(dataspec, 0) + summary.records.get(dataspec, 0)
-        if summary.empty:
+        _read_one(link, store, dataspec, race_key, result, log=log)
+
+
+def _read_one(
+    link: Any, store: DuckStore, dataspec: str, race_key: str, result: TimeseriesResult, *, log: Callable[[str], None],
+) -> None:
+    """1つのデータ種別・1レースぶんを読む。失敗しても呼び手は次へ進む。"""
+    from .jvlink import JVLinkError
+
+    written = 0
+    try:
+        if not link.rt_open(dataspec, race_key):
             result.empty[dataspec] = result.empty.get(dataspec, 0) + 1
-        if summary.failed:
-            result.failed.append(f"{dataspec} {race_key}")
+            return
+        for record in link.records():
+            store.write(record.data)
+            written += 1
+    except JVLinkError as error:
+        log(f"  取得できませんでした（{dataspec} {race_key}）: {error}")
+        result.failed.append(f"{dataspec} {race_key}")
+    finally:
+        link.close()
+    result.records[dataspec] = result.records.get(dataspec, 0) + written
 
 
 def _races_by_day(races_db: Path, first: str, last: str) -> dict[str, list[str]]:
