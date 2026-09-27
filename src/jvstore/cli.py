@@ -4,6 +4,8 @@
     jvstore fetch --dataspec RACE ...  蓄積系データ(JVOpen)を期間を指定して取得する
     jvstore rt --dataspec 0B15 ...     速報系データ(JVRTOpen)を取得する
     jvstore realtime --date 2026-09-20 開催日の速報（オッズ・馬体重・天候馬場・マイニング予想 …）をまとめて取得する
+    jvstore timeseries --from ... --to ... 期間の全レースの時系列オッズ（締め切り前の断面）をまとめて取得する
+    jvstore merge-odds --from other.duckdb 別の DuckDB に貯めたオッズの断面を足す
     jvstore parse raw/ ...             保存済みの生データを読み込む（JV-Link 不要）
     jvstore spec build --xlsx ...      JV-Data仕様書 xlsx からレイアウト定義を生成
     jvstore spec list                  取り込める表（レコード種別）とデータ種別IDの一覧
@@ -436,6 +438,37 @@ def cmd_realtime(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_timeseries(args: argparse.Namespace) -> int:
+    """期間の中央の全レースの時系列オッズ（締め切り前の断面）をまとめて DuckDB へ入れる。
+
+    取得の本体は :mod:`jvstore.timeseries` にある。
+    """
+    from .timeseries import fetch_timeseries
+
+    result = fetch_timeseries(
+        Path(args.db), args.from_, args.to,
+        races_db=Path(args.races_db) if args.races_db else None, refetch=args.refetch,
+        log=_log, layouts=_load_layouts(args), link_factory=lambda: _open_link(args),
+    )
+    _log("")
+    for name, counts in (("取り込んだレコード", result.records), ("取り込み済みで飛ばしたレース", result.skipped),
+                         ("該当データなしのレース", result.empty)):
+        _log(f"{name}: " + (", ".join(f"{dataspec} {count:,}" for dataspec, count in counts.items()) or "なし"))
+    if result.failed:
+        _log(f"取得できなかったもの（{len(result.failed):,} 件。もう一度同じコマンドで取り直せる）: {', '.join(result.failed[:20])}")
+        return 1
+    return 0
+
+
+def cmd_merge_odds(args: argparse.Namespace) -> int:
+    """別の DuckDB に貯めたオッズの断面を、``--db`` に足す。本体は :mod:`jvstore.merge`。"""
+    from .merge import merge_odds
+
+    _log(f"{Path(args.source).resolve()} のオッズを {Path(args.db).resolve()} に移します")
+    merge_odds(Path(args.source), Path(args.db), log=_log, layouts=_load_layouts(args))
+    return 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     link = _open_link(args)
     _log("JV-Link の設定ダイアログを開きます（利用キーの登録・利用規約への同意）")
@@ -595,6 +628,31 @@ def _add_realtime_parser(subparsers: argparse._SubParsersAction) -> None:
     realtime.set_defaults(func=cmd_realtime)
 
 
+def _add_timeseries_parsers(subparsers: argparse._SubParsersAction) -> None:
+    timeseries = subparsers.add_parser(
+        "timeseries",
+        help="期間の中央の全レースの時系列オッズ（単複枠 0B41・馬連 0B42。提供期間は1年）をまとめて DuckDB に入れる",
+    )
+    timeseries.add_argument("--from", dest="from_", required=True, help="最初の開催日 YYYY-MM-DD")
+    timeseries.add_argument("--to", required=True, help="最後の開催日 YYYY-MM-DD（この日も含む）")
+    timeseries.add_argument("--db", default="jvdata.duckdb", help="取り込み先の DuckDB（既定: jvdata.duckdb）")
+    timeseries.add_argument(
+        "--races-db", help="レースの一覧（ra）を読む DuckDB（既定: --db と同じ）。取り込み先を別のファイルにするときに指定する",
+    )
+    timeseries.add_argument("--refetch", action="store_true", help="取り込み済みのレースも取り直す")
+    timeseries.add_argument("--layouts")
+    _add_jvlink_args(timeseries)
+    timeseries.set_defaults(func=cmd_timeseries)
+
+    merge = subparsers.add_parser(
+        "merge-odds", help="別の DuckDB に貯めたオッズの断面のうち、--db に無いものを足す",
+    )
+    merge.add_argument("--from", dest="source", required=True, help="移す元の DuckDB（jvstore timeseries の取り込み先）")
+    merge.add_argument("--db", default="jvdata.duckdb", help="移す先の DuckDB（既定: jvdata.duckdb）")
+    merge.add_argument("--layouts")
+    merge.set_defaults(func=cmd_merge_odds)
+
+
 def _add_setup_parser(subparsers: argparse._SubParsersAction) -> None:
     setup = subparsers.add_parser("setup", help="JV-Link の設定ダイアログを開く")
     setup.add_argument("--sid", default="UNKNOWN")
@@ -650,6 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_parse_parser(subparsers)
     _add_sync_parser(subparsers)
     _add_realtime_parser(subparsers)
+    _add_timeseries_parsers(subparsers)
     _add_setup_parser(subparsers)
     _add_screen_parsers(subparsers)
     return parser
