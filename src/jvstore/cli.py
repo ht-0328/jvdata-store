@@ -4,6 +4,7 @@
     jvstore fetch --dataspec RACE ...  蓄積系データ(JVOpen)を期間を指定して取得する
     jvstore rt --dataspec 0B15 ...     速報系データ(JVRTOpen)を取得する
     jvstore realtime --date 2026-09-20 開催日の速報（オッズ・馬体重・天候馬場・マイニング予想 …）をまとめて取得する
+    jvstore realtime --follow          開催日の間動き続け、各レースの発走前に速報を取り直す
     jvstore timeseries --from ... --to ... 期間の全レースの時系列オッズ（締め切り前の断面）をまとめて取得する
     jvstore merge-odds --from other.duckdb 別の DuckDB に貯めたオッズの断面を足す
     jvstore parse raw/ ...             保存済みの生データを読み込む（JV-Link 不要）
@@ -422,15 +423,22 @@ def cmd_realtime(args: argparse.Namespace) -> int:
     from datetime import date
 
     from .realtime import fetch_day, parse_day
+    from .realtime_follow import follow_day
 
     days = [parse_day(day) for day in (args.date or [date.today().isoformat()])]
     failed: list[str] = []
     for position, day in enumerate(days):
         if position:
             _log("")
-        result = fetch_day(
-            Path(args.db), day, log=_log, layouts=_load_layouts(args), link_factory=lambda: _open_link(args),
-        )
+        if args.follow:
+            result = follow_day(
+                Path(args.db), day, minutes_before=args.minutes_before, log=_log, layouts=_load_layouts(args),
+                link_factory=lambda: _open_link(args),
+            )
+        else:
+            result = fetch_day(
+                Path(args.db), day, log=_log, layouts=_load_layouts(args), link_factory=lambda: _open_link(args),
+            )
         failed += [f"{day} {dataspec}" for dataspec in result.failed]
     if failed:
         _log(f"取得できなかったデータ種別: {', '.join(failed)}")
@@ -622,6 +630,13 @@ def _add_realtime_parser(subparsers: argparse._SubParsersAction) -> None:
     realtime.add_argument(
         "--date", action="append",
         help="開催日 YYYY-MM-DD（何度でも書ける。省略すると今日）。速報の提供期間は1週間",
+    )
+    realtime.add_argument(
+        "--follow", action="store_true",
+        help="その日の最後のレースが終わるまで動き続け、各レースの発走前にオッズ・馬体重・開催情報を取り直す。最後に成績と払戻を取る",
+    )
+    realtime.add_argument(
+        "--minutes-before", type=int, default=12, help="--follow で、発走の何分前に取り直すか（既定: 12）",
     )
     _add_jvlink_args(realtime)
     _add_output_args(realtime)
