@@ -287,6 +287,10 @@ class DuckStore:
             "  keys VARCHAR, columns INTEGER, children VARCHAR)"
         )
 
+    def ensure_tables(self, record_id: str) -> None:
+        """レコード種別の親と子の表を、まだ無ければ作る。レコードを書かずに表だけ要るとき（移し替え）に使う。"""
+        self._ensure_table(self.specs[record_id])
+
     def _ensure_table(self, spec: TableSpec) -> None:
         if spec.record_id in self._ready:
             return
