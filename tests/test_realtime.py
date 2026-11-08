@@ -109,6 +109,68 @@ def test_取ったレコードは_DuckDB_に入る(tmp_path):
         con.close()
 
 
+def _win5_record(status: str, made: str, venues: tuple[str, ...] = ("06", "09", "06", "09", "06")) -> bytes:
+    """WIN5（WF）の1レコード。対象5レースは、その日の 9〜11R を2場に振り分けた合成の値。"""
+    races = [
+        {"競馬場コード": venue, "開催回[第N回]": "01", "開催日目[N日目]": "02", "レース番号": f"{9 + index // 2:02d}"}
+        for index, venue in enumerate(venues)
+    ]
+    return make_record(
+        "WF",
+        {"開催年": DAY[:4], "開催月日": DAY[4:], "データ区分": status, "データ作成年月日": made,
+         "キャリーオーバー金額初期": "000000012345678"},
+        repeats={"wf__重勝式対象レース情報": races},
+    )
+
+
+def _win5_rows(tmp_path):
+    import duckdb
+
+    con = duckdb.connect(str(tmp_path / "db.duckdb"), read_only=True)
+    try:
+        parent = con.execute('SELECT "開催年", "開催月日", "データ区分", "キャリーオーバー金額初期" FROM wf').fetchall()
+        races = con.execute(
+            'SELECT "_連番", "競馬場コード", "開催回[第N回]", "開催日目[N日目]", "レース番号" '
+            'FROM "wf__重勝式対象レース情報" ORDER BY "_連番"'
+        ).fetchall()
+    finally:
+        con.close()
+    return parent, races
+
+
+def test_WIN5の速報は開催日のキーで取り_wfと対象レースの子表に入る(tmp_path):
+    link = FakeLink({"0B15": [_race_record()], "0B51": [_win5_record("1", DAY)]})
+    result, _ = _fetch(tmp_path, link)
+    assert ("0B51", DAY) in link.calls and result.records["0B51"] == 1
+    parent, races = _win5_rows(tmp_path)
+    assert parent == [(DAY[:4], DAY[4:], "1", "000000012345678")]
+    assert races == [
+        (1, "06", "01", "02", "09"), (2, "09", "01", "02", "09"), (3, "06", "01", "02", "10"),
+        (4, "09", "01", "02", "10"), (5, "06", "01", "02", "11"),
+    ]
+
+
+def test_WIN5の速報は区分が進むと置き換わり_子表も入れ替わる(tmp_path):
+    _fetch(tmp_path, FakeLink({"0B51": [_win5_record("1", DAY)]}))
+    _fetch(tmp_path, FakeLink({"0B51": [_win5_record("3", DAY, venues=("05",) * 5)]}))
+    parent, races = _win5_rows(tmp_path)
+    assert [row[2] for row in parent] == ["3"]
+    assert len(races) == 5 and {race[1] for race in races} == {"05"}
+
+
+def test_蓄積系の確定成績は_あとから取った速報で上書きされない(tmp_path):
+    """月曜に作られる確定成績（7）は、日曜に作られた速報（3）より新しい版として残る。"""
+    from jvstore.store import DuckStore
+
+    monday = DAY[:6] + f"{int(DAY[6:]) + 1:02d}"
+    with DuckStore(tmp_path / "db.duckdb", LAYOUTS) as store:
+        store.write(_win5_record("7", monday))
+    _fetch(tmp_path, FakeLink({"0B51": [_win5_record("3", DAY, venues=("05",) * 5)]}))
+    parent, races = _win5_rows(tmp_path)
+    assert [row[2] for row in parent] == ["7"]
+    assert {race[1] for race in races} == {"06", "09"}
+
+
 def test_開催日の書き方():
     assert parse_day("2026-09-20") == "20260920" and parse_day("20260920") == "20260920" and parse_day("2026/09/20") == "20260920"
     for bad in ("", "2026-9-20x", "20261340", "202609"):
